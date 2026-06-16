@@ -773,8 +773,16 @@ def _build_child_progress_callback(
     prefix = f"[{task_index + 1}] " if task_count > 1 else ""
     goal_label = (goal or "").strip()
 
-    # Gateway: batch tool names, flush periodically
-    _BATCH_SIZE = 5
+    # Gateway: relay each tool's progress summary as it happens. Historically
+    # this batched 5 tool names before flushing a single subagent.progress
+    # line, with any remainder flushed only at completion via _flush(). That
+    # made short subagents (the common case — 0-4 tools) emit their progress
+    # rollup ONLY at end-of-run, so a live subagent window showed nothing until
+    # the child finished ("subagent output just appears all at once"). Flushing
+    # per tool keeps the window streaming in step with the child's work. The
+    # per-tool subagent.tool events already fire live; this aligns the progress
+    # summary with them instead of lagging behind a 5-deep buffer.
+    _BATCH_SIZE = 1
     _batch: List[str] = []
     _tool_count = [0]  # per-subagent running counter (list for closure mutation)
 
