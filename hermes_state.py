@@ -120,7 +120,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 17  # v17: tel_* telemetry tables (local-plane observability, raw values)
+SCHEMA_VERSION = 17  # v17: tel_* telemetry tables (local observability) — runs, spans, model/tool calls, errors
 
 # ---------------------------------------------------------------------------
 # WAL-compatibility fallback
@@ -604,18 +604,18 @@ CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
 
--- ── Telemetry (local plane: local observability) ───────────────────────────
+-- ── Telemetry (local observability) ─────────────────────────────────────────
 -- Event/span layer co-located in state.db so runs JOIN to sessions/messages.
 -- The append-only JSONL log at ~/.hermes/telemetry/events.jsonl is the source
 -- of truth; these tables are a rebuildable index. They hold the user's own data
 -- (real model ids, provider/tool names) and never leave the machine unless the
--- user exports them.
+-- user exports them. A "run" is one session (from on_session_start to
+-- on_session_finalize); model/tool calls within it are recorded as spans.
 
 CREATE TABLE IF NOT EXISTS tel_runs (
     run_id TEXT PRIMARY KEY,
     trace_id TEXT NOT NULL,
     session_id TEXT,
-    profile_id TEXT,
     entrypoint TEXT NOT NULL,
     platform TEXT,
     start_ns INTEGER NOT NULL,
@@ -624,8 +624,6 @@ CREATE TABLE IF NOT EXISTS tel_runs (
     model_call_count INTEGER DEFAULT 0,
     tool_call_count INTEGER DEFAULT 0,
     error_count INTEGER DEFAULT 0,
-    estimated_cost_usd REAL,
-    cost_status TEXT,
     schema_v INTEGER NOT NULL DEFAULT 1
 );
 
@@ -638,8 +636,7 @@ CREATE TABLE IF NOT EXISTS tel_spans (
     kind TEXT,
     start_ns INTEGER NOT NULL,
     end_ns INTEGER,
-    status TEXT,
-    attrs_json TEXT
+    status TEXT
 );
 
 CREATE TABLE IF NOT EXISTS tel_model_calls (
@@ -653,50 +650,15 @@ CREATE TABLE IF NOT EXISTS tel_model_calls (
     cache_read_tokens INTEGER DEFAULT 0,
     cache_write_tokens INTEGER DEFAULT 0,
     reasoning_tokens INTEGER DEFAULT 0,
-    latency_ms INTEGER,
-    ttft_ms INTEGER,
-    estimated_cost_usd REAL,
-    cost_status TEXT,
-    cost_source TEXT,
-    end_reason TEXT,
-    retry_count INTEGER DEFAULT 0
+    latency_ms INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS tel_tool_calls (
     span_id TEXT PRIMARY KEY,
     run_id TEXT NOT NULL,
     tool_name TEXT, -- raw tool name (e.g. "web_search")
-    backend TEXT,
     duration_ms INTEGER,
-    result_class TEXT,
-    retry_count INTEGER DEFAULT 0,
-    approval TEXT
-);
-
-CREATE TABLE IF NOT EXISTS tel_gateway_events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT, ts_ns INTEGER NOT NULL,
-    platform TEXT, direction TEXT, result TEXT,
-    voice INTEGER DEFAULT 0, attachments INTEGER DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS tel_cron_events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT, ts_ns INTEGER NOT NULL,
-    kind TEXT, result TEXT
-);
-
-CREATE TABLE IF NOT EXISTS tel_skill_events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT, ts_ns INTEGER NOT NULL,
-    action TEXT, skill_name TEXT -- skill_name the local plane only
-);
-
-CREATE TABLE IF NOT EXISTS tel_memory_events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT, ts_ns INTEGER NOT NULL,
-    action TEXT, result TEXT
-);
-
-CREATE TABLE IF NOT EXISTS tel_feedback_events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT, ts_ns INTEGER NOT NULL,
-    kind TEXT
+    result_class TEXT
 );
 
 CREATE TABLE IF NOT EXISTS tel_error_events (
