@@ -2,7 +2,6 @@
  *  section chrome, and the masked scroller. Pure SDK + tokens. */
 
 import {
-  cn,
   coarseElapsed,
   Codicon,
   DropdownMenu,
@@ -230,6 +229,7 @@ export function ScrollFade({
     edges.above ? 'transparent, black 1.25rem' : 'black',
     edges.below ? 'calc(100% - 1.25rem), transparent' : 'black'
   ]
+
   const mask = `linear-gradient(to bottom, ${stops[0]}, black ${stops[1]})`
 
   return (

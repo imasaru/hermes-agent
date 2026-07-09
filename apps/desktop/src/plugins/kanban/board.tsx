@@ -385,6 +385,7 @@ function NewTaskDialog({
 
     try {
       const skillList = skills.split(',').map(s => s.trim()).filter(Boolean)
+
       // create() derives status (triage flag → 'triage', else 'ready'); move to
       // the requested column when they differ, so a per-column add lands right.
       const { task, warning } = await createTask({
@@ -626,11 +627,13 @@ export function KanbanBoardPage() {
   const qc = useQueryClient()
   const slug = useValue($boardSlug)
   const [archived, setArchived] = useState(false)
+
   const { data: board, dataUpdatedAt, error, isFetching } = useQuery({
     queryFn: () => fetchBoard(archived),
     queryKey: boardKey(slug, archived),
     refetchInterval: 8_000
   })
+
   const [openId, setOpenId] = useState<null | string>(null)
   const [addStatus, setAddStatus] = useState<null | string>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -649,6 +652,7 @@ export function KanbanBoardPage() {
   })
 
   const columnNames = board?.columns.map(col => col.name) ?? []
+
   const parentOptions = useMemo(
     () => board?.columns.flatMap(col => col.tasks).map(task => ({ id: task.id, title: task.title })) ?? [],
     [board]
@@ -672,6 +676,7 @@ export function KanbanBoardPage() {
   }, [board, search, tenant, assignee, attentionOnly])
 
   const total = filtered?.columns.reduce((sum, col) => sum + col.tasks.length, 0) ?? 0
+
   // A completed card can still carry crash-history diagnostics (the backend
   // scans run history, and Done is not excluded) — but "needs attention" is a
   // to-do signal, and a done card has nothing left to do. Count active lanes only.

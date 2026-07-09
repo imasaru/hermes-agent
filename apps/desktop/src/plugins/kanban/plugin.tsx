@@ -33,6 +33,7 @@ import { KanbanBoardPage } from './board'
 // the page); hidden when nothing is in flight (or unloaded).
 function KanbanCount() {
   const slug = useValue($boardSlug)
+
   const { data: board } = useQuery({
     queryFn: () => fetchBoard(false),
     queryKey: boardKey(slug, false),
