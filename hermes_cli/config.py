@@ -2534,6 +2534,13 @@ DEFAULT_CONFIG = {
         "mode": "manual",
         "timeout": 60,
         "cron_mode": "deny",
+        # Declarative per-tool approval policy. Keys are case-insensitive
+        # fnmatch globs matched against both the tool name and its registered
+        # toolset name; values are deny, ask, or allow. When several patterns
+        # match, the most restrictive decision wins (deny > ask > allow).
+        # Explicit allow never bypasses command hardlines/user denies, session
+        # tool scope, cron policy, plugin escalation, or path protections.
+        "tool_policies": {},
         # User-defined deny rules: fnmatch globs matched against terminal
         # commands. A match blocks the command unconditionally — BEFORE the
         # --yolo / /yolo / mode=off bypass — making this the user-editable

@@ -7,12 +7,20 @@ contract helpers here so agent-loop call sites and plugins share one vocabulary.
 
 from __future__ import annotations
 
+import contextvars
+import fnmatch
+import json
 import logging
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+_TOOL_POLICY_PRIORITY = {"allow": 0, "ask": 1, "deny": 2}
+_active_tool_policy_checks: contextvars.ContextVar[tuple[str, ...]] = (
+    contextvars.ContextVar("active_tool_policy_checks", default=())
+)
 
 OBSERVER_SCHEMA_VERSION = "hermes.observer.v1"
 MIDDLEWARE_SCHEMA_VERSION = "hermes.middleware.v1"
@@ -195,19 +203,129 @@ def run_tool_execution_middleware(
     next_call: Callable[[Dict[str, Any]], Any],
     **context: Any,
 ) -> Any:
-    """Run tool execution through registered tool execution middleware."""
-    callbacks = _get_middleware_callbacks(TOOL_EXECUTION_MIDDLEWARE)
-    if not callbacks:
-        return next_call(args)
-    return _run_execution_chain(
-        TOOL_EXECUTION_MIDDLEWARE,
-        callbacks,
-        next_call,
-        tool_name=tool_name,
-        args=args,
-        original_args=context.pop("original_args", args),
-        **context,
+    """Run a tool through the shared policy gate and plugin middleware chain."""
+    active_checks = _active_tool_policy_checks.get()
+    policy_already_checked = tool_name in active_checks
+    token = None
+    terminal_allow_token = None
+    if not policy_already_checked:
+        policy = resolve_tool_approval_policy(tool_name)
+        blocked = _apply_tool_approval_policy(tool_name, policy)
+        if blocked is not None:
+            return blocked
+        token = _active_tool_policy_checks.set((*active_checks, tool_name))
+        if tool_name == "terminal" and policy == "allow":
+            from tools.approval import set_tool_policy_terminal_allow
+
+            terminal_allow_token = set_tool_policy_terminal_allow()
+
+    try:
+        callbacks = _get_middleware_callbacks(TOOL_EXECUTION_MIDDLEWARE)
+        if not callbacks:
+            return next_call(args)
+        return _run_execution_chain(
+            TOOL_EXECUTION_MIDDLEWARE,
+            callbacks,
+            next_call,
+            tool_name=tool_name,
+            args=args,
+            original_args=context.pop("original_args", args),
+            **context,
+        )
+    finally:
+        if terminal_allow_token is not None:
+            from tools.approval import reset_tool_policy_terminal_allow
+
+            reset_tool_policy_terminal_allow(terminal_allow_token)
+        if token is not None:
+            _active_tool_policy_checks.reset(token)
+
+
+def resolve_tool_approval_policy(tool_name: str) -> Optional[str]:
+    """Resolve glob policies for a tool name and its registered toolset."""
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config() or {}
+        approvals = config.get("approvals", {}) or {}
+        patterns = approvals.get("tool_policies", {}) or {}
+    except Exception as exc:
+        logger.warning("Failed to load tool approval policies: %s", exc)
+        return None
+    if not isinstance(patterns, dict):
+        return None
+
+    identifiers = [str(tool_name or "").strip().lower()]
+    try:
+        from tools.registry import registry
+
+        entry = registry.get_entry(tool_name)
+        toolset = str(getattr(entry, "toolset", "") or "").strip().lower()
+        if toolset:
+            identifiers.append(toolset)
+    except Exception:
+        pass
+
+    matches: list[str] = []
+    for pattern, raw_policy in patterns.items():
+        if not isinstance(pattern, str) or not isinstance(raw_policy, str):
+            continue
+        normalized_pattern = pattern.strip().lower()
+        policy = raw_policy.strip().lower()
+        if not normalized_pattern or policy not in _TOOL_POLICY_PRIORITY:
+            continue
+        if any(
+            fnmatch.fnmatchcase(identifier, normalized_pattern)
+            for identifier in identifiers
+        ):
+            matches.append(policy)
+    if not matches:
+        return None
+    return max(matches, key=_TOOL_POLICY_PRIORITY.__getitem__)
+
+
+def _apply_tool_approval_policy(
+    tool_name: str, policy: Optional[str]
+) -> Optional[str]:
+    """Return a synthetic blocked result, or None to continue execution."""
+    if policy == "deny":
+        return json.dumps(
+            {
+                "error": (
+                    f"BLOCKED: Tool '{tool_name}' is denied by "
+                    "approvals.tool_policies in config.yaml."
+                ),
+                "policy": "deny",
+                "tool": tool_name,
+            },
+            ensure_ascii=False,
+        )
+    if policy != "ask":
+        return None
+
+    try:
+        from tools.approval import request_tool_approval
+
+        decision = request_tool_approval(
+            tool_name,
+            f"config.yaml requires approval for tool '{tool_name}'",
+            rule_key=f"tool_policy:{tool_name}",
+        )
+    except Exception as exc:
+        logger.warning("Tool approval policy check failed for %s: %s", tool_name, exc)
+        decision = {
+            "approved": False,
+            "message": "BLOCKED: tool approval policy could not be evaluated.",
+        }
+    if decision.get("approved"):
+        return None
+    payload = dict(decision)
+    payload["error"] = payload.pop("message", None) or (
+        f"BLOCKED: Tool '{tool_name}' was not approved."
     )
+    payload.setdefault("policy", "ask")
+    payload.setdefault("tool", tool_name)
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def run_api_execution_middleware(
