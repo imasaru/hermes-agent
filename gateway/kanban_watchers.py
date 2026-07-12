@@ -16,13 +16,43 @@ import os
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Union
 
 from agent.i18n import t
 
 # Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
 # "gateway.run") so extracted log records keep their original logger name.
 logger = logging.getLogger("gateway.run")
+
+
+def parse_notification_sources(
+    raw: Any,
+) -> Union[None, str, frozenset[str]]:
+    """Normalize ``notification_sources`` from config for the kanban notifier.
+
+    Documented (kanban-worker SKILL / issue #39838):
+
+    - ``['*']`` or ``\"*\"`` (or a list/string containing ``*``) → accept
+      subscriptions owned by any profile.
+    - ``['coder', 'orchestrator']`` or ``\"coder,orchestrator\"`` → allowlist.
+    - unset / missing / unparseable → ``None`` (default isolation: only the
+      gateway's own profile, or owners that already have multiplex adapters).
+
+    Empty string / empty list is treated as wildcard so ``notification_sources:
+    '*'`` and ``notification_sources: []`` both "open the gate" when the
+    operator is intentionally clearing the default isolation.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+    elif isinstance(raw, (list, tuple)):
+        parts = [str(item).strip() for item in raw if str(item).strip()]
+    else:
+        return None
+    if not parts or any(p == "*" for p in parts):
+        return "*"
+    return frozenset(parts)
 
 
 def _resolve_auto_decompose_settings(
@@ -155,6 +185,17 @@ class GatewayKanbanWatchersMixin:
                 "kanban notifier: disabled via config kanban.dispatch_in_gateway=false"
             )
             return
+
+        # Load notification_sources allowlist (or wildcard) so the notifier
+        # can accept cross-profile Kanban subscriptions.  See kanban-worker
+        # SKILL.md and issue #39838. Prefer top-level key (documented); also
+        # accept nested ``kanban.notification_sources`` for discoverability.
+        ns_raw = None
+        if isinstance(cfg, dict):
+            ns_raw = cfg.get("notification_sources")
+            if ns_raw is None and isinstance(kanban_cfg, dict):
+                ns_raw = kanban_cfg.get("notification_sources")
+        _notification_sources = parse_notification_sources(ns_raw)
         from gateway.config import Platform as _Platform
         try:
             from hermes_cli import kanban_db as _kb
@@ -254,11 +295,27 @@ class GatewayKanbanWatchersMixin:
                             for sub in subs:
                                 owner_profile = sub.get("notifier_profile") or None
                                 if owner_profile and owner_profile != notifier_profile:
-                                    _owner_adapters = getattr(self, "_profile_adapters", {}).get(owner_profile)
-                                    if not _owner_adapters:
+                                    # Apply notification_sources when configured
+                                    # (wildcard or allowlist). When unset, keep
+                                    # default isolation: only deliver if this
+                                    # gateway already has multiplex adapters for
+                                    # the owner profile.
+                                    if _notification_sources is None:
+                                        _owner_adapters = getattr(
+                                            self, "_profile_adapters", {}
+                                        ).get(owner_profile)
+                                        if not _owner_adapters:
+                                            logger.debug(
+                                                "kanban notifier: subscription for %s owned by profile %s; current profile %s has no adapter for it, skipping",
+                                                sub.get("task_id"), owner_profile, notifier_profile,
+                                            )
+                                            continue
+                                    elif _notification_sources == "*":
+                                        pass  # accept all profiles
+                                    elif owner_profile not in _notification_sources:
                                         logger.debug(
-                                            "kanban notifier: subscription for %s owned by profile %s; current profile %s has no adapter for it, skipping",
-                                            sub.get("task_id"), owner_profile, notifier_profile,
+                                            "kanban notifier: subscription for %s owned by profile %s; not in notification_sources allowlist, skipping",
+                                            sub.get("task_id"), owner_profile,
                                         )
                                         continue
                                 platform = (sub.get("platform") or "").lower()
@@ -321,6 +378,40 @@ class GatewayKanbanWatchersMixin:
                     # exists to fix). The helper returns None only when the profile
                     # (or default) genuinely has no adapter for the platform.
                     adapter = self._authorization_adapter(plat, sub_profile or None)
+                    # Single-gateway + notification_sources: subs stamped by a
+                    # worker profile (coder/orchestrator/…) typically have no
+                    # multiplex registry entry. When the config explicitly
+                    # allows that owner AND the owner has no multiplex map at
+                    # all, deliver via this gateway's connected adapters so
+                    # multi-profile board alerts reach the user (#39838).
+                    # If the owner IS multiplexed but missing this platform,
+                    # fail closed (do not borrow the default bot) — same
+                    # contract as _authorization_adapter.
+                    #
+                    # Same-profile case: when sub_profile == notifier_profile
+                    # the sub was stamped by this gateway's own worker, so
+                    # always deliver via self.adapters[plat] regardless of
+                    # _notification_sources (preserves default behaviour).
+                    if adapter is None and sub_profile:
+                        profile_adapters = getattr(self, "_profile_adapters", None) or {}
+                        if sub_profile == notifier_profile:
+                            # Same-profile: always deliver via this gateway's
+                            # own adapters (default isolation preserved).
+                            adapters = getattr(self, "adapters", None) or {}
+                            adapter = adapters.get(plat)
+                        elif (
+                            _notification_sources is not None
+                            and (
+                                _notification_sources == "*"
+                                or sub_profile in _notification_sources
+                            )
+                            and sub_profile not in profile_adapters
+                        ):
+                            # notification_sources allows this owner and the
+                            # owner has no multiplex entry → deliver via this
+                            # gateway's adapter.
+                            adapters = getattr(self, "adapters", None) or {}
+                            adapter = adapters.get(plat)
                     if adapter is None:
                         logger.debug(
                             "kanban notifier: adapter %s disconnected before delivery for %s; rewinding claim",
@@ -413,9 +504,20 @@ class GatewayKanbanWatchersMixin:
                             sub["chat_id"], sub.get("thread_id") or "",
                         )
                         try:
-                            await adapter.send(
+                            result = await adapter.send(
                                 sub["chat_id"], msg, metadata=metadata,
                             )
+                            # Check SendResult.success to catch soft failures
+                            # (e.g. wrong chat_id, platform soft-fail). Without
+                            # this check, success=False was treated as delivered
+                            # and the cursor advanced, permanently losing the
+                            # event — the bug reported in #31901.
+                            # Handle None for backward compatibility with
+                            # adapters that don't return SendResult.
+                            if result is not None and not result.success:
+                                raise RuntimeError(
+                                    f"send returned success=False: {result.error or 'unknown'}"
+                                )
                             logger.debug(
                                 "kanban notifier: delivered %s event for %s to %s/%s on board %s",
                                 kind, sub["task_id"], platform_str, sub["chat_id"], board_slug,
