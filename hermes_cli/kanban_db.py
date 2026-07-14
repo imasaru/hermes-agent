@@ -233,6 +233,16 @@ DEFAULT_CRASH_GRACE_SECONDS = 30
 # 0/1/2 codes the worker uses for success / generic failure / usage error.
 KANBAN_RATE_LIMIT_EXIT_CODE = 75
 
+# Sentinel exit code a kanban worker uses to signal "I bailed because the
+# gateway is at the active session cap (max_concurrent_sessions), not because
+# the task failed." The dispatcher's reap classifier maps this to a
+# ``session_cap`` exit kind so ``detect_crashed_workers`` can release the task
+# back to ``ready`` WITHOUT counting a failure (the circuit breaker must never
+# trip on a transient capacity wall). 42 is well clear of the 0/1/2 codes the
+# worker uses for success / generic failure / usage error, and distinct from
+# the rate-limit sentinel (75).
+KANBAN_SESSION_CAP_EXIT_CODE = 42
+
 
 def _resolve_crash_grace_seconds() -> int:
     """Return the crash-detection grace period in seconds.
@@ -273,6 +283,38 @@ def _resolve_rate_limit_cooldown_seconds() -> int:
         if parsed >= 0:
             return parsed
     return DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
+
+
+# Cooldown after a session-cap requeue before the dispatcher re-spawns the
+# worker. Without this, a task released by the session-cap path would be
+# re-spawned on the very next tick and immediately bounce off the same
+# session-cap wall, burning a worker slot every tick for hours. The cooldown
+# spaces retries out so the board keeps cheaply probing whether a slot is
+# free without thrashing. Overridable via ``HERMES_KANBAN_SESSION_CAP_COOLDOWN_SECONDS``
+# for operators who want a tighter/looser probe cadence.
+DEFAULT_SESSION_CAP_COOLDOWN_SECONDS = 60  # 1 minute
+
+
+def _resolve_session_cap_cooldown_seconds() -> int:
+    """Return the session-cap requeue cooldown in seconds.
+
+    Reads ``HERMES_KANBAN_SESSION_CAP_COOLDOWN_SECONDS`` from the environment;
+    falls back to ``DEFAULT_SESSION_CAP_COOLDOWN_SECONDS`` when absent, empty,
+    non-integer, or negative. A value of 0 disables the cooldown (re-spawn on
+    the next tick) — useful for tests that want to assert the task becomes
+    spawnable again immediately.
+    """
+    raw = os.environ.get(
+        "HERMES_KANBAN_SESSION_CAP_COOLDOWN_SECONDS", ""
+    ).strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            parsed = -1
+        if parsed >= 0:
+            return parsed
+    return DEFAULT_SESSION_CAP_COOLDOWN_SECONDS
 
 
 # Worker-context caps so build_worker_context() stays bounded on
@@ -4890,6 +4932,120 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         return True
 
 
+# ---------------------------------------------------------------------------
+# Kanban approval helpers (gateway approve/deny flow)
+# ---------------------------------------------------------------------------
+
+def approve_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor: str,
+    reason: Optional[str] = None,
+) -> tuple[bool, str]:
+    """Approve a blocked task: add audit comment, unblock, record events.
+
+    This is the gateway-side handler for ``/kanban approve <task_id>``.
+    It:
+
+    1. Validates the task exists and is in a blockable state (``blocked``
+       or ``scheduled``).
+    2. Adds an audit comment ``APPROVED via gateway: {reason}``.
+    3. Calls :func:`unblock_task` to flip status to ``ready``/``todo``.
+    4. Appends an ``approved`` event with actor + reason payload.
+
+    Returns ``(True, success_msg)`` on success or ``(False, error_msg)``
+    when the task is not approvable (not found, not blocked, already
+    terminal, etc.).
+
+    For review-required blocks this is the primary path: the user taps
+    "Approve" in the gateway chat and the task is automatically promoted
+    to ready so the dispatcher respawns the worker with the approval
+    comment in context.
+    """
+    if not actor or not actor.strip():
+        return False, "actor is required"
+    actor = actor.strip()
+    # Validate task exists and check current status
+    row = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return False, f"task {task_id} not found"
+    cur_status = row["status"]
+    if cur_status not in ("blocked", "scheduled"):
+        return False, (
+            f"task {task_id} is {cur_status!r}; "
+            f"approve only applies to 'blocked' or 'scheduled' tasks"
+        )
+    reason = reason.strip() if reason and reason.strip() else None
+    with write_txn(conn):
+        # Add audit comment
+        comment_body = f"APPROVED via gateway: {reason}" if reason else "APPROVED via gateway"
+        add_comment(conn, task_id, actor, comment_body)
+        # Unblock (respects parent gating: ready vs todo)
+        unblocked = unblock_task(conn, task_id)
+        if not unblocked:
+            # Task changed state during our txn — already terminal or
+            # parents changed. Leave the comment but report failure.
+            return False, f"task {task_id} was already unblocked or changed state"
+        # Record approval event
+        _append_event(
+            conn, task_id, "approved",
+            {"actor": actor, "reason": reason},
+        )
+    return True, f"approved {task_id}"
+
+
+def deny_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor: str,
+    reason: Optional[str] = None,
+) -> tuple[bool, str]:
+    """Deny (reject) a blocked task: add audit comment and event.
+
+    This is the gateway-side handler for ``/kanban deny <task_id>``.
+    Unlike approve, deny does NOT unblock the task — it records the
+    rejection so the worker can be unblocked later with changes.
+
+    1. Validates the task exists and is in a blockable state.
+    2. Adds an audit comment ``DENIED via gateway: {reason}``.
+    3. Appends a ``denied`` event with actor + reason payload.
+    4. Leaves the task in ``blocked`` status.
+
+    Returns ``(True, success_msg)`` on success or ``(False, error_msg)``
+    when the task is not deniable.
+    """
+    if not actor or not actor.strip():
+        return False, "actor is required"
+    actor = actor.strip()
+    # Validate task exists and check current status
+    row = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return False, f"task {task_id} not found"
+    cur_status = row["status"]
+    if cur_status not in ("blocked", "scheduled"):
+        return False, (
+            f"task {task_id} is {cur_status!r}; "
+            f"deny only applies to 'blocked' or 'scheduled' tasks"
+        )
+    reason = reason.strip() if reason and reason.strip() else None
+    with write_txn(conn):
+        # Add audit comment
+        comment_body = f"DENIED via gateway: {reason}" if reason else "DENIED via gateway"
+        add_comment(conn, task_id, actor, comment_body)
+        # Record denial event (task stays blocked)
+        _append_event(
+            conn, task_id, "denied",
+            {"actor": actor, "reason": reason},
+        )
+    return True, f"denied {task_id}"
+
+
 def specify_triage_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5133,6 +5289,31 @@ def decompose_triage_task(
                 {"by": author or "decomposer", "from_decompose_of": task_id},
             )
             child_ids.append(new_id)
+
+        # Copy root kanban_notify_subs to each child so that child
+        # blocked/completed events notify the origin chat. Without this,
+        # decomposed children are silent to subscribers of the root task
+        # — the bug reported in #31901.
+        root_subs = conn.execute(
+            "SELECT * FROM kanban_notify_subs WHERE task_id = ?",
+            (task_id,),
+        ).fetchall()
+        for cid in child_ids:
+            for sub in root_subs:
+                conn.execute(
+                    "INSERT OR IGNORE INTO kanban_notify_subs "
+                    "(task_id, platform, chat_id, thread_id, user_id, notifier_profile, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        cid,
+                        sub["platform"],
+                        sub["chat_id"],
+                        sub["thread_id"],
+                        sub["user_id"],
+                        sub["notifier_profile"],
+                        now,
+                    ),
+                )
 
         # Link children to their sibling parents (within the decomposed graph).
         for idx, child in enumerate(children):
@@ -5796,6 +5977,12 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
       provider rate-limited / exhausted quota, NOT because the task failed.
       ``detect_crashed_workers`` releases the task back to ``ready`` without
       counting a failure, so a long quota window can't trip the breaker.
+    * ``"session_cap"`` — ``WIFEXITED`` with status
+      ``KANBAN_SESSION_CAP_EXIT_CODE``. The worker bailed because the
+      gateway is at the active session cap (``max_concurrent_sessions``),
+      NOT because the task failed. ``detect_crashed_workers`` releases the
+      task back to ``ready`` without counting a failure, so a transient
+      capacity wall can't trip the breaker.
     * ``"nonzero_exit"`` — ``WIFEXITED`` with non-zero status. Real error.
     * ``"signaled"`` — ``WIFSIGNALED`` (OOM killer, SIGKILL, etc). Real crash.
     * ``"unknown"`` — pid was not in the reap registry (either reaped by
@@ -5803,8 +5990,8 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
       back to existing crashed-counter behavior.
 
     ``code`` is the exit status (for ``clean_exit`` / ``rate_limited`` /
-    ``nonzero_exit``) or the signal number (for ``signaled``), or ``None``
-    for ``unknown``.
+    ``session_cap`` / ``nonzero_exit``) or the signal number (for
+    ``signaled``), or ``None`` for ``unknown``.
     """
     entry = _recent_worker_exits.get(int(pid))
     if entry is None:
@@ -5817,6 +6004,8 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
                 return ("clean_exit", 0)
             if code == KANBAN_RATE_LIMIT_EXIT_CODE:
                 return ("rate_limited", code)
+            if code == KANBAN_SESSION_CAP_EXIT_CODE:
+                return ("session_cap", code)
             return ("nonzero_exit", code)
         if os.WIFSIGNALED(raw):
             return ("signaled", os.WTERMSIG(raw))
@@ -6368,11 +6557,22 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     to ``ready`` WITHOUT counting a failure (so a long quota window can't
     trip the breaker) and stamped with a quota-blocker error so
     ``check_respawn_guard`` defers their respawn until the window clears.
-    The ids are returned via the ``_last_rate_limited`` function attribute
-    (the public return stays the crashed-only ``list[str]``).
+
+    When the reap registry shows the worker exited with the session-cap
+    sentinel (``KANBAN_SESSION_CAP_EXIT_CODE``), the worker bailed because
+    the gateway is at the active session cap (``max_concurrent_sessions``),
+    NOT a task failure. Such tasks are released back to ``ready`` WITHOUT
+    counting a failure (so a transient capacity wall can't trip the breaker)
+    and stamped with a session-cap error so ``check_respawn_guard`` defers
+    their respawn until a slot opens.
+
+    The ids are returned via the ``_last_rate_limited`` and
+    ``_last_session_cap`` function attributes (the public return stays the
+    crashed-only ``list[str]``).
     """
     crashed: list[str] = []
     rate_limited: list[str] = []
+    session_cap: list[str] = []
     # Per-crash details collected inside the main txn, used after it
     # closes to run ``_record_task_failure`` (which needs its own
     # write_txn so can't nest). ``protocol_violation`` flags the
@@ -6405,6 +6605,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
             rate_limited_exit = False
+            session_cap_exit = False
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
@@ -6441,6 +6642,26 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     "claimer": row["claim_lock"],
                     "exit_code": code,
                 }
+            elif kind == "session_cap":
+                # Worker bailed because the gateway is at the active session
+                # cap (``max_concurrent_sessions``). This is NOT a task failure
+                # — the task is fine, the gateway just has no free slots.
+                # Release it back to ``ready`` so the respawn guard defers it
+                # until a slot opens, and crucially do NOT count a failure
+                # (skip ``_record_task_failure``) so a transient capacity wall
+                # can't trip the circuit breaker and permanently block the card.
+                protocol_violation = False
+                session_cap_exit = True
+                error_text = (
+                    f"pid {pid} exited session-cap (active session limit) — "
+                    f"requeued without counting a failure"
+                )
+                event_kind = "session_cap"
+                event_payload = {
+                    "pid": pid,
+                    "claimer": row["claim_lock"],
+                    "exit_code": code,
+                }
             else:
                 protocol_violation = False
                 if kind == "nonzero_exit":
@@ -6463,10 +6684,16 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 (row["id"], pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
-                # Rate-limited requeues are a clean release, not a crash —
-                # record the run outcome as ``rate_limited`` so the board
-                # history doesn't show a phantom crash for a quota wall.
-                _run_outcome = "rate_limited" if rate_limited_exit else "crashed"
+                # Transient requeues (rate-limited / session-cap) are clean
+                # releases, not crashes — record the run outcome accordingly
+                # so the board history doesn't show a phantom crash for a
+                # transient wall.
+                if rate_limited_exit:
+                    _run_outcome = "rate_limited"
+                elif session_cap_exit:
+                    _run_outcome = "session_cap"
+                else:
+                    _run_outcome = "crashed"
                 run_id = _end_run(
                     conn, row["id"],
                     outcome=_run_outcome, status=_run_outcome,
@@ -6489,6 +6716,14 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                         (error_text[:500], row["id"]),
                     )
                     rate_limited.append(row["id"])
+                elif session_cap_exit:
+                    # Same treatment as rate_limited: stamp the error column
+                    # so the respawn guard defers, but do NOT count a failure.
+                    conn.execute(
+                        "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+                        (error_text[:500], row["id"]),
+                    )
+                    session_cap.append(row["id"])
                 else:
                     crashed.append(row["id"])
                     crash_details.append(
@@ -6537,6 +6772,9 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # Same side-channel for rate-limited requeues — these did NOT count a
     # failure and are NOT crashes, so they stay out of the ``crashed`` return.
     detect_crashed_workers._last_rate_limited = rate_limited  # type: ignore[attr-defined]
+    # Same side-channel for session-cap requeues — same treatment as
+    # rate_limited: no failure counted, not a crash.
+    detect_crashed_workers._last_session_cap = session_cap  # type: ignore[attr-defined]
     return crashed
 
 
@@ -6776,6 +7014,20 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         never increments ``consecutive_failures``, so the breaker can't free
         it). Once the cooldown elapses the task falls through and respawns.
 
+    ``"session_cap_cooldown"``
+        The task's most recent run ended with the ``session_cap`` outcome
+        (a worker bailed because the gateway is at the active session cap
+        via the ``KANBAN_SESSION_CAP_EXIT_CODE`` sentinel) within
+        ``_resolve_session_cap_cooldown_seconds()``. The gateway almost
+        certainly has no free slots yet, so defer the respawn until the
+        cooldown elapses — then allow a cheap probe. This is checked
+        BEFORE ``blocker_auth`` because the session-cap requeue stamps a
+        session-cap-flavored ``last_failure_error`` that would otherwise
+        match the auth-blocker regex and park the task forever (the
+        session-cap path never increments ``consecutive_failures``, so the
+        breaker can't free it). Once the cooldown elapses the task falls
+        through and respawns.
+
     ``"blocker_auth"``
         The task's last failure error matches a quota / authentication
         pattern. Retrying immediately is unlikely to help (rate limits
@@ -6845,6 +7097,37 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         # blocker_auth check below doesn't catch the rate-limit text we
         # stamped on the task; this path intentionally retries forever
         # (cheaply, spaced by the cooldown) until quota returns or a real
+        # crash/completion supersedes it.
+        return None
+
+    # 1b. Session-cap cooldown. The most recent run ended ``session_cap``
+    #     (active session limit) — defer while inside the cooldown window,
+    #     then allow a cheap probe. Must run BEFORE the blocker_auth regex
+    #     check, because a session-cap requeue stamps a session-cap-flavored
+    #     last_failure_error that the regex would otherwise match → defer
+    #     forever (no failure counter increment on this path means the breaker
+    #     can never free it).
+    #
+    #     We look at the LATEST run only (ORDER BY ended_at DESC LIMIT 1): if
+    #     a newer crash/completion superseded the session-cap run, this guard
+    #     no longer applies and the normal paths take over.
+    sc_cooldown = _resolve_session_cap_cooldown_seconds()
+    if (
+        latest_run is not None
+        and latest_run["outcome"] == "session_cap"
+    ):
+        if sc_cooldown <= 0:
+            # Cooldown disabled — respawn immediately, and skip the
+            # blocker_auth regex so the stamped session-cap text doesn't
+            # re-trap the task.
+            return None
+        ended_at = latest_run["ended_at"]
+        if ended_at is not None and (now - int(ended_at)) < sc_cooldown:
+            return "session_cap_cooldown"
+        # Cooldown elapsed — allow the respawn. Return early so the
+        # blocker_auth check below doesn't catch the session-cap text we
+        # stamped on the task; this path intentionally retries forever
+        # (cheaply, spaced by the cooldown) until a slot opens or a real
         # crash/completion supersedes it.
         return None
 

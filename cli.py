@@ -16051,7 +16051,14 @@ def main(
     # Handle single query mode
     if query or image:
         if not cli._claim_active_session("cli", stderr=bool(quiet)):
-            sys.exit(1)
+            # Exit with the session-cap sentinel so the dispatcher's reap
+            # classifier recognises this as a transient capacity wall (not
+            # a task failure) and requeues without counting a failure.
+            try:
+                from hermes_cli.kanban_db import KANBAN_SESSION_CAP_EXIT_CODE
+                sys.exit(KANBAN_SESSION_CAP_EXIT_CODE)
+            except ImportError:
+                sys.exit(1)
         try:
             query, single_query_images = _collect_query_images(query, image)
             # Kanban workers spawn with ``hermes chat -q "work kanban task <id>"``;

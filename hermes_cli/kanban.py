@@ -584,6 +584,30 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_unblock.add_argument("task_ids", nargs="+")
 
+    # --- approve ---
+    p_approve = sub.add_parser(
+        "approve",
+        help="Approve a blocked task (add audit comment, unblock, record event)",
+    )
+    p_approve.add_argument("task_ids", nargs="+", help="Task id(s) to approve")
+    p_approve.add_argument(
+        "--reason",
+        default=None,
+        help="Optional reason/note — recorded as an audit comment. Quote multi-word reasons.",
+    )
+
+    # --- deny ---
+    p_deny = sub.add_parser(
+        "deny",
+        help="Deny (reject) a blocked task (add audit comment and event, leave blocked)",
+    )
+    p_deny.add_argument("task_ids", nargs="+", help="Task id(s) to deny")
+    p_deny.add_argument(
+        "--reason",
+        default=None,
+        help="Optional reason/note — recorded as an audit comment. Quote multi-word reasons.",
+    )
+
     p_promote = sub.add_parser(
         "promote",
         help="Manually move one or more todo/blocked tasks to ready (recovery path)",
@@ -956,6 +980,8 @@ def kanban_command(args: argparse.Namespace) -> int:
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
+            "approve":  _cmd_approve,
+            "deny":     _cmd_deny,
             "promote":  _cmd_promote,
             "archive":  _cmd_archive,
             "tail":     _cmd_tail,
@@ -2014,6 +2040,48 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
                 print(f"cannot unblock {tid} (not blocked/scheduled?)", file=sys.stderr)
             else:
                 print(f"Unblocked {tid}" + (f": {reason}" if reason else ""))
+    return 0 if not failed else 1
+
+
+def _cmd_approve(args: argparse.Namespace) -> int:
+    ids = list(args.task_ids or [])
+    if not ids:
+        print("at least one task_id is required", file=sys.stderr)
+        return 1
+    reason = getattr(args, "reason", None)
+    if reason is not None:
+        reason = reason.strip() or None
+    author = _profile_author()
+    failed: list[str] = []
+    with kb.connect_closing() as conn:
+        for tid in ids:
+            ok, msg = kb.approve_task(conn, tid, actor=author, reason=reason)
+            if ok:
+                print(msg)
+            else:
+                failed.append(tid)
+                print(f"cannot approve {tid}: {msg}", file=sys.stderr)
+    return 0 if not failed else 1
+
+
+def _cmd_deny(args: argparse.Namespace) -> int:
+    ids = list(args.task_ids or [])
+    if not ids:
+        print("at least one task_id is required", file=sys.stderr)
+        return 1
+    reason = getattr(args, "reason", None)
+    if reason is not None:
+        reason = reason.strip() or None
+    author = _profile_author()
+    failed: list[str] = []
+    with kb.connect_closing() as conn:
+        for tid in ids:
+            ok, msg = kb.deny_task(conn, tid, actor=author, reason=reason)
+            if ok:
+                print(msg)
+            else:
+                failed.append(tid)
+                print(f"cannot deny {tid}: {msg}", file=sys.stderr)
     return 0 if not failed else 1
 
 

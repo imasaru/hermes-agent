@@ -66,6 +66,28 @@ class TestResolveUv:
             from hermes_cli.managed_uv import resolve_uv
             assert resolve_uv() is None
 
+    def test_wrong_platform_binary_removed(self, tmp_path):
+        uv = tmp_path / "bin" / "uv"
+        uv.parent.mkdir(parents=True)
+        # Linux ELF header on a mocked Darwin host.
+        uv.write_bytes(b"\x7fELF" + b"\x00" * 100)
+        uv.chmod(uv.stat().st_mode | stat.S_IEXEC)
+        with patch("hermes_cli.managed_uv.get_hermes_home", return_value=tmp_path), \
+             patch("hermes_cli.managed_uv.platform.system", return_value="Darwin"):
+            from hermes_cli.managed_uv import resolve_uv
+            assert resolve_uv() is None
+            assert not uv.exists()
+
+    def test_macho_binary_accepted_on_darwin(self, tmp_path):
+        uv = tmp_path / "bin" / "uv"
+        uv.parent.mkdir(parents=True)
+        uv.write_bytes(b"\xcf\xfa\xed\xfe" + b"\x00" * 100)
+        uv.chmod(uv.stat().st_mode | stat.S_IEXEC)
+        with patch("hermes_cli.managed_uv.get_hermes_home", return_value=tmp_path), \
+             patch("hermes_cli.managed_uv.platform.system", return_value="Darwin"):
+            from hermes_cli.managed_uv import resolve_uv
+            assert resolve_uv() == str(uv)
+
 
 # ---------------------------------------------------------------------------
 # ensure_uv
@@ -228,6 +250,15 @@ class TestUpdateManagedUv:
             result = update_managed_uv()
             # Still returns the path — failure is non-fatal
             assert result == str(tmp_path / "bin" / "uv")
+
+    def test_exec_format_error_removes_binary(self, tmp_path):
+        uv = tmp_path / "bin" / "uv"
+        _make_executable(uv)
+        with patch("hermes_cli.managed_uv.get_hermes_home", return_value=tmp_path), \
+             patch("hermes_cli.managed_uv.subprocess.run", side_effect=OSError(8, "Exec format error")):
+            from hermes_cli.managed_uv import update_managed_uv
+            assert update_managed_uv() is None
+            assert not uv.exists()
 
 
 # ---------------------------------------------------------------------------

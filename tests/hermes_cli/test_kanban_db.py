@@ -1063,6 +1063,158 @@ def test_resolve_rate_limit_cooldown_handles_bad_env(monkeypatch):
         )
 
 
+def test_classify_worker_exit_recognizes_session_cap_sentinel(kanban_home):
+    import hermes_cli.kanban_db as _kb
+
+    pid = 42000
+    _kb._record_worker_exit(pid, _exited_status(_kb.KANBAN_SESSION_CAP_EXIT_CODE))
+    kind, code = _kb._classify_worker_exit(pid)
+    assert kind == "session_cap"
+    assert code == _kb.KANBAN_SESSION_CAP_EXIT_CODE
+
+    # Plain non-zero exit is still a normal crash, not session_cap.
+    _kb._record_worker_exit(pid + 1, _exited_status(1))
+    assert _kb._classify_worker_exit(pid + 1) == ("nonzero_exit", 1)
+
+
+def test_session_cap_exit_requeues_without_counting_failure(
+    kanban_home, monkeypatch,
+):
+    """A session-cap sentinel exit releases the task to ``ready`` and leaves
+    ``consecutive_failures`` untouched — the breaker must never trip on a
+    transient capacity wall, even across many session-cap hits."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="sc", assignee="a")
+
+        # Simulate many session-cap hits.
+        for i in range(6):
+            pid = 80000 + i
+            kb.claim_task(conn, tid, claimer=f"{host}:w{i}")
+            conn.execute(
+                "UPDATE tasks SET worker_pid=?, consecutive_failures=? "
+                "WHERE id=?",
+                (pid, 0, tid),
+            )
+            conn.commit()
+            _kb._record_worker_exit(
+                pid, _exited_status(_kb.KANBAN_SESSION_CAP_EXIT_CODE)
+            )
+
+            crashed = kb.detect_crashed_workers(conn)
+            assert tid not in crashed
+            sc = getattr(_kb.detect_crashed_workers, "_last_session_cap", [])
+            assert tid in sc
+
+            task = kb.get_task(conn, tid)
+            assert task.status == "ready", (
+                f"hit {i}: should requeue ready, got {task.status}"
+            )
+            assert task.consecutive_failures == 0, (
+                f"hit {i}: session-cap must not count a failure, "
+                f"got {task.consecutive_failures}"
+            )
+
+        # Last failure error stamped so the respawn guard recognizes the
+        # session-cap wall.
+        assert task.last_failure_error and "session-cap" in task.last_failure_error
+
+        # A ``session_cap`` run outcome was recorded (not ``crashed``).
+        outcomes = [
+            r["outcome"] for r in conn.execute(
+                "SELECT outcome FROM task_runs WHERE task_id=?", (tid,),
+            ).fetchall()
+        ]
+        assert "session_cap" in outcomes
+        assert "crashed" not in outcomes
+
+
+def test_respawn_guard_defers_session_cap_within_cooldown(
+    kanban_home, monkeypatch,
+):
+    """Within the cooldown after a session-cap requeue, the guard defers the
+    respawn; after the cooldown it allows a probe — and crucially does NOT
+    fall into ``blocker_auth`` (which would defer forever)."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setenv("HERMES_KANBAN_SESSION_CAP_COOLDOWN_SECONDS", "60")
+    now = 7_000_000
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="sc-guard", assignee="a")
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+        conn.execute(
+            "UPDATE task_runs SET outcome='session_cap', status='session_cap', "
+            "ended_at=? WHERE id=?",
+            (now, run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+            "last_failure_error=? WHERE id=?",
+            ("pid 1 exited session-cap (active session limit) — requeued", tid),
+        )
+        conn.commit()
+
+        # Inside cooldown → defer with the session-cap-specific reason.
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 10)
+        assert kb.check_respawn_guard(conn, tid) == "session_cap_cooldown"
+
+        # Past cooldown → allowed (None), NOT trapped by blocker_auth even
+        # though last_failure_error contains "session-cap".
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 120)
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
+def test_respawn_guard_session_cap_cooldown_zero_allows_immediately(
+    kanban_home, monkeypatch,
+):
+    """Cooldown of 0 disables the wait — task is spawnable on the next tick,
+    and the stamped session-cap text does not re-trap it via blocker_auth."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setenv("HERMES_KANBAN_SESSION_CAP_COOLDOWN_SECONDS", "0")
+    now = 8_000_000
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="sc-zero", assignee="a")
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+        conn.execute(
+            "UPDATE task_runs SET outcome='session_cap', status='session_cap', "
+            "ended_at=? WHERE id=?",
+            (now, run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "claim_lock=NULL, last_failure_error=? WHERE id=?",
+            ("pid 1 exited session-cap (active session limit)", tid),
+        )
+        conn.commit()
+
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 1)
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
+def test_resolve_session_cap_cooldown_handles_bad_env(monkeypatch):
+    import hermes_cli.kanban_db as _kb
+
+    for bad_val in ("notanumber", "-5", ""):
+        monkeypatch.setenv(
+            "HERMES_KANBAN_SESSION_CAP_COOLDOWN_SECONDS", bad_val
+        )
+        assert (
+            _kb._resolve_session_cap_cooldown_seconds()
+            == _kb.DEFAULT_SESSION_CAP_COOLDOWN_SECONDS
+        )
+
+
 def test_max_runtime_uses_current_run_start_after_retry(kanban_home, monkeypatch):
     """A retry should get a fresh max-runtime window.
 
