@@ -27,6 +27,55 @@ logger = logging.getLogger(__name__)
 # Public helpers
 # ---------------------------------------------------------------------------
 
+# Mach-O / universal-binary magics (Darwin).
+_MACHO_MAGICS = frozenset({
+    b"\xfe\xed\xfa\xce",  # MH_MAGIC
+    b"\xce\xfa\xed\xfe",  # MH_CIGAM
+    b"\xfe\xed\xfa\xcf",  # MH_MAGIC_64
+    b"\xcf\xfa\xed\xfe",  # MH_CIGAM_64
+    b"\xca\xfe\xba\xbe",  # FAT_MAGIC
+    b"\xbe\xba\xfe\xca",  # FAT_CIGAM
+})
+
+
+def _uv_binary_compatible(path: Path) -> bool:
+    """Return True if *path* looks executable on this OS.
+
+    ``os.access(X_OK)`` alone is not enough — a profile copied from another
+    machine can leave a Linux ELF (or Windows PE) binary with the execute bit
+    set, which then fails at runtime with ``OSError: [Errno 8] Exec format
+    error`` on macOS.
+    """
+    try:
+        with open(path, "rb") as f:
+            header = f.read(4)
+    except OSError:
+        return False
+
+    if header.startswith(b"#!"):
+        return True
+
+    system = platform.system()
+    if system == "Windows":
+        return header[:2] == b"MZ"
+    if system == "Darwin":
+        return header in _MACHO_MAGICS
+    return header == b"\x7fELF"
+
+
+def _discard_incompatible_uv(path: Path) -> None:
+    """Remove a managed uv binary that cannot run on this platform."""
+    logger.warning(
+        "Managed uv at %s is not compatible with %s — removing",
+        path,
+        platform.system(),
+    )
+    try:
+        path.unlink()
+    except OSError as exc:
+        logger.debug("Could not remove incompatible uv at %s: %s", path, exc)
+
+
 def managed_uv_path() -> Path:
     """Return the path where Hermes keeps *its* uv binary.
 
@@ -46,9 +95,12 @@ def resolve_uv() -> Optional[str]:
     No side effects — pure lookup.
     """
     p = managed_uv_path()
-    if p.is_file() and os.access(p, os.X_OK):
-        return str(p)
-    return None
+    if not (p.is_file() and os.access(p, os.X_OK)):
+        return None
+    if not _uv_binary_compatible(p):
+        _discard_incompatible_uv(p)
+        return None
+    return str(p)
 
 
 class _UvResult(str):
@@ -167,12 +219,18 @@ def update_managed_uv() -> Optional[str]:
         # Not installed yet — ensure_uv() will handle that elsewhere.
         return None
 
-    result = subprocess.run(
-        [existing, "self", "update"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            [existing, "self", "update"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        # Wrong-arch/copy-from-remote binaries surface here on POSIX.
+        logger.warning("Managed uv at %s failed to execute (%s)", existing, exc)
+        _discard_incompatible_uv(Path(existing))
+        return None
     if result.returncode == 0:
         version = subprocess.run(
             [existing, "--version"],
