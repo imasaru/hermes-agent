@@ -2113,7 +2113,14 @@ def has_blocking_approval(session_key: str) -> bool:
 
 
 def submit_pending(session_key: str, approval: dict):
-    """Store a pending approval request for a session."""
+    """Store a pending approval request for a session.
+    Injects HERMES_KANBAN_TASK if present so gateway and kanban history
+    can associate the permission approval request with the task (t_bb012ceb).
+    """
+    approval = dict(approval)  # copy to avoid mutating caller
+    task_id = os.environ.get("HERMES_KANBAN_TASK")
+    if task_id:
+        approval["task_id"] = task_id
     with _lock:
         _pending[session_key] = approval
 
@@ -2764,6 +2771,12 @@ def _run_approval_gate(
                 "description": redact_sensitive_text(description),
                 "allow_permanent": True,
             }
+            # Route agent permission approvals through gateway with task context
+            # for kanban workers (t_bb012ceb). Payload includes task_id for
+            # gateway delivery + kanban history logging.
+            task_id = os.environ.get("HERMES_KANBAN_TASK")
+            if task_id:
+                approval_data["task_id"] = task_id
             decision = _await_gateway_decision(
                 session_key, notify_cb, approval_data, surface="gateway"
             )
@@ -2809,13 +2822,47 @@ def _run_approval_gate(
                 save_permanent_allowlist(_permanent_approved)
             return {"approved": True, "message": None}
 
-        # No notify callback (e.g. API server without an attached chat):
-        # queue for /approve /deny review, agent sees approval_required.
-        submit_pending(session_key, {
-            "command": display_target,
-            "pattern_key": pattern_key,
-            "description": description,
-        })
+        # No notify callback (e.g. API server without an attached chat or kanban worker subprocess):
+        # For kanban workers: use forward + await to route via gateway and bypass LLM/manual board (t_bb012ceb).
+        # The await blocks until user resolves via gateway (file poll), so LLM never sees "pending_approval".
+        task_id = os.environ.get("HERMES_KANBAN_TASK")
+        if task_id:
+            _forward_kanban_permission_approval(task_id, {"command": display_target, "pattern_key": pattern_key, "description": description})
+            decision = _await_kanban_permission_approval(task_id)
+            resolved = decision.get("resolved", False)
+            choice = decision.get("choice")
+            deny_reason = decision.get("reason")
+            if not resolved or choice is None or choice == "deny":
+                if not resolved:
+                    reason = "timed out without user response"
+                    timeout_addendum = " Silence is not consent."
+                else:
+                    reason = "denied by user"
+                    timeout_addendum = ""
+                reason_addendum = ""
+                if resolved and deny_reason:
+                    reason_addendum = f' Reason given by the user: "{deny_reason}".'
+                return {
+                    "approved": False,
+                    "message": (
+                        f"BLOCKED: Action {reason}.{reason_addendum} The user "
+                        f"has NOT consented to this action. Do NOT retry it, "
+                        f"do NOT rephrase it, and do NOT attempt the same "
+                        f"outcome via a different path.{timeout_addendum}"
+                    ),
+                    "pattern_key": pattern_key,
+                    "description": description,
+                    "user_consent": False,
+                }
+            # approved for this execution (kanban permissions are one-shot per request;
+            # session/always persistence can be layered later if needed)
+            return {"approved": True, "message": None}
+        else:
+            submit_pending(session_key, {
+                "command": display_target,
+                "pattern_key": pattern_key,
+                "description": description,
+            })
         return {
             "approved": False,
             "pattern_key": pattern_key,
@@ -3167,7 +3214,152 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         surface=surface,
         choice=_outcome,
     )
-    return {"resolved": resolved, "choice": choice, "reason": entry.reason}
+
+def _get_kanban_approval_dir() -> "Path":
+    """Directory for cross-process kanban permission approval state (shared file for worker <-> gateway)."""
+    from pathlib import Path
+    base = Path(os.environ.get("HERMES_KANBAN_WORKSPACES_ROOT", str(Path.home() / ".hermes" / "kanban")))
+    d = base / "pending_approvals"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _kanban_permission_pending_path(task_id: str) -> "Path":
+    from pathlib import Path
+    return _get_kanban_approval_dir() / f"{task_id}.json"
+
+
+def _forward_kanban_permission_approval(task_id: str, approval_data: dict) -> None:
+    """Forward permission approval request for kanban worker to gateway.
+    Writes shared pending file + appends kanban comment/event for delivery via notifier + history.
+    Payload includes task_id, command, reason/desc as required.
+    """
+    from pathlib import Path
+    import json as _json
+    path = _kanban_permission_pending_path(task_id)
+    data = {
+        "status": "pending",
+        "task_id": task_id,
+        "timestamp": time.time(),
+        "approval": dict(approval_data),
+    }
+    with open(path, "w") as f:
+        _json.dump(data, f, indent=2)
+
+    # Log to kanban DB for history and to trigger delivery in gateway notifier (user sees in chat)
+    try:
+        from hermes_cli import kanban_db as kb
+        conn = kb.connect()
+        try:
+            cmd = str(approval_data.get("command", ""))[:300]
+            desc = str(approval_data.get("description", ""))
+            comment_body = f"[GATEWAY PERMISSION APPROVAL] task {task_id}\nCommand: {cmd}\nDesc: {desc}\n\nReply with /approve (or /kanban approve) to allow this command for the worker. Task ID included for routing."
+            kb.add_comment(conn, task_id, "gateway:approval-forward", comment_body)
+            kb._append_event(conn, task_id, "permission_approval_requested", {
+                "task_id": task_id,
+                "command": cmd,
+                "description": desc,
+                "pattern_key": approval_data.get("pattern_key", ""),
+                "source": "agent_permission_approval",
+            })
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.warning("kanban forward for permission approval failed (history may be partial): %s", exc)
+
+
+def _await_kanban_permission_approval(task_id: str, timeout_seconds: int = 300) -> dict:
+    """Block (with activity heartbeats) until gateway/user resolves the permission approval via shared file.
+    Returns decision dict with choice/resolved/reason. Used to avoid surfacing pending_approval to LLM for kanban workers.
+    """
+    from pathlib import Path
+    import json as _json
+    import time as _time
+    path = _kanban_permission_pending_path(task_id)
+    deadline = _time.time() + max(timeout_seconds, 30)
+    while _time.time() < deadline:
+        try:
+            if path.exists():
+                with open(path) as f:
+                    data = _json.load(f)
+                if data.get("status") == "resolved":
+                    choice = data.get("choice") or "deny"
+                    reason = data.get("reason")
+                    # leave file for audit or clean later
+                    return {"resolved": True, "choice": choice, "reason": reason}
+        except Exception:
+            pass
+        # touch activity so gateway doesn't kill the worker during wait
+        try:
+            from tools.environments.base import touch_activity_if_due
+            touch_activity_if_due({"last_touch": _time.monotonic()}, "waiting for kanban permission approval")
+        except Exception:
+            pass
+        _time.sleep(1.0)
+    # Timeout path: return deny to prevent caller from crashing on None
+    return {"resolved": False, "choice": "deny", "reason": "timeout waiting for gateway approval"}
+    
+def _resolve_kanban_permission_approval(task_id: str, choice: str = "once", reason: Optional[str] = None) -> bool:
+    """Resolve a specific kanban permission pending file (write status=resolved + choice/reason).
+    Also appends kanban comment/event for history. Returns True on success.
+    """
+    path = _kanban_permission_pending_path(task_id)
+    if not path.exists():
+        return False
+    try:
+        import json as _json
+        with open(path) as f:
+            data = _json.load(f)
+        data["status"] = "resolved"
+        data["choice"] = choice or "once"
+        if reason is not None:
+            data["reason"] = reason
+        data["resolved_at"] = time.time()
+        with open(path, "w") as f:
+            _json.dump(data, f, indent=2)
+
+        # record to kanban history (for audit + any watchers)
+        try:
+            from hermes_cli import kanban_db as kb
+            conn = kb.connect()
+            try:
+                kb.add_comment(conn, task_id, "gateway:permission-approval", f"PERMISSION {(choice or 'once').upper()} via gateway")
+                kb._append_event(conn, task_id, "permission_approval_resolved", {
+                    "task_id": task_id,
+                    "choice": choice or "once",
+                    "reason": reason or "",
+                })
+            finally:
+                conn.close()
+        except Exception:
+            pass
+        return True
+    except Exception as exc:
+        logger.warning("resolve kanban permission %s failed: %s", task_id, exc)
+        return False
+
+
+def resolve_kanban_permission_approvals(choice: str = "once", reason: Optional[str] = None) -> int:
+    """Resolve all pending kanban permission files (for /approve in gateway).
+    Returns number of files successfully marked resolved.
+    """
+    from pathlib import Path
+    import json as _json
+    d = _get_kanban_approval_dir()
+    count = 0
+    for p in sorted(d.glob("*.json")):
+        if not p.name.startswith("t_"):
+            continue
+        try:
+            with open(p) as f:
+                data = _json.load(f)
+            if data.get("status") == "pending":
+                tid = data.get("task_id") or p.stem
+                if _resolve_kanban_permission_approval(tid, choice, reason):
+                    count += 1
+        except Exception:
+            pass
+    return count
 
 
 def check_all_command_guards(command: str, env_type: str,
@@ -3451,6 +3643,11 @@ def check_all_command_guards(command: str, env_type: str,
             }
             if smart_denied_for_owner:
                 approval_data["smart_denied"] = True
+            # Route agent permission approvals through gateway with task context
+            # for kanban workers (t_bb012ceb). Payload includes task_id.
+            task_id = os.environ.get("HERMES_KANBAN_TASK")
+            if task_id:
+                approval_data["task_id"] = task_id
             decision = _await_gateway_decision(
                 session_key, notify_cb, approval_data, surface="gateway"
             )
@@ -3519,12 +3716,52 @@ def check_all_command_guards(command: str, env_type: str,
                     "user_approved": True, "description": combined_desc}
 
         # Fallback: no gateway callback registered (e.g. cron, batch).
-        # Return approval_required for backward compat. Redact secrets in the
-        # user-facing copy — the raw `command` is preserved for execution and
-        # the allowlist keys off pattern_key, so redaction is display-only.
+        # For kanban workers (t_bb012ceb): forward + await via shared file so
+        # the worker blocks until gateway resolution without surfacing pending_approval to LLM.
+        # Return approval_required for backward compat in non-kanban cases.
         from agent.redact import redact_sensitive_text
         _disp_command = redact_sensitive_text(command)
         _disp_combined_desc = redact_sensitive_text(combined_desc)
+        task_id = os.environ.get("HERMES_KANBAN_TASK")
+        if task_id:
+            _forward_kanban_permission_approval(task_id, {
+                "command": _disp_command,
+                "pattern_key": primary_key,
+                "pattern_keys": all_keys,
+                "description": _disp_combined_desc,
+            })
+            decision = _await_kanban_permission_approval(task_id)
+            resolved = decision.get("resolved", False)
+            choice = decision.get("choice")
+            deny_reason = decision.get("reason")
+            if not resolved or choice is None or choice == "deny":
+                if not resolved:
+                    reason = "timed out without user response"
+                    timeout_addendum = " Silence is not consent."
+                else:
+                    reason = "denied by user"
+                    timeout_addendum = ""
+                reason_addendum = ""
+                if resolved and deny_reason:
+                    reason_addendum = f' Reason given by the user: "{deny_reason}".'
+                return {
+                    "approved": False,
+                    "message": (
+                        f"BLOCKED: Command {reason}.{reason_addendum} The user "
+                        f"has NOT consented to this action. Do NOT retry this "
+                        f"command, do NOT rephrase it, and do NOT attempt the "
+                        f"same outcome via a different command. Stop the "
+                        f"current workflow and wait for the user to respond "
+                        f"before taking any further destructive or "
+                        f"irreversible action.{timeout_addendum}"
+                    ),
+                    "pattern_key": primary_key,
+                    "description": combined_desc,
+                    "outcome": "denied" if resolved else "timeout",
+                    "user_consent": False,
+                    "deny_reason": deny_reason,
+                }
+            return {"approved": True, "message": None, "user_approved": True, "description": combined_desc}
         pending_data = {
             "command": _disp_command,
             "pattern_key": primary_key,
@@ -3782,6 +4019,11 @@ def check_execute_code_guard(code: str, env_type: str,
     }
     if smart_denied_for_owner:
         approval_data["smart_denied"] = True
+    # Route agent permission approvals through gateway with task context
+    # for kanban workers (t_bb012ceb). Payload includes task_id.
+    task_id = os.environ.get("HERMES_KANBAN_TASK")
+    if task_id:
+        approval_data["task_id"] = task_id
     decision = _await_gateway_decision(
         session_key, notify_cb, approval_data, surface="gateway"
     )

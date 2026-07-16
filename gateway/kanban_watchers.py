@@ -196,6 +196,23 @@ class GatewayKanbanWatchersMixin:
             if ns_raw is None and isinstance(kanban_cfg, dict):
                 ns_raw = kanban_cfg.get("notification_sources")
         _notification_sources = parse_notification_sources(ns_raw)
+
+        # Read kanban.approvals.auto_subscribe config option (default True)
+        # When enabled, tasks that block for human-review kinds (needs_input,
+        # capability, review-required) are auto-subscribed so the creator
+        # receives approval notifications without manual /kanban subscribe.
+        auto_subscribe_enabled = True  # default on
+        if isinstance(kanban_cfg, dict):
+            approvals_cfg = kanban_cfg.get("approvals", {})
+            if isinstance(approvals_cfg, dict):
+                auto_subscribe_enabled = bool(approvals_cfg.get("auto_subscribe", True))
+            else:
+                # Backward compat: approvals_cfg might be a bool directly
+                auto_subscribe_enabled = bool(approvals_cfg)
+        logger.debug(
+            "kanban notifier: auto_subscribe=%s", auto_subscribe_enabled,
+        )
+
         from gateway.config import Platform as _Platform
         try:
             from hermes_cli import kanban_db as _kb
@@ -458,9 +475,47 @@ class GatewayKanbanWatchersMixin:
                             )
                         elif kind == "blocked":
                             reason = ""
-                            if ev.payload and ev.payload.get("reason"):
-                                reason = f": {str(ev.payload['reason'])[:160]}"
-                            msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
+                            block_kind = None
+                            if ev.payload:
+                                if ev.payload.get("reason"):
+                                    reason = f": {str(ev.payload['reason'])[:160]}"
+                                block_kind = ev.payload.get("kind")
+                            # Check if this is a human-review block (needs_input,
+                            # capability, review-required). For those kinds, render
+                            # richer formatting with actionable approval commands.
+                            is_approval_block = block_kind in {
+                                "needs_input", "capability", "review-required",
+                            }
+                            if is_approval_block:
+                                kind_label = block_kind or "human-review"
+                                # Get task title and workspace for richer context
+                                task_title = ""
+                                task_workspace = ""
+                                if task is not None:
+                                    task_title = task.title or ""
+                                    task_workspace = task.workspace_path or ""
+                                # Build the enhanced notification
+                                lines = [
+                                    f"⏸ {board_tag}{tag}Kanban {sub['task_id']} "
+                                    f"blocked ({kind_label}){reason}",
+                                ]
+                                if task_title:
+                                    lines.append(f"\nTask: {task_title}")
+                                if task_workspace:
+                                    lines.append(f"Workspace: {task_workspace}")
+                                # Add review-required specific guidance
+                                if block_kind == "review-required":
+                                    lines.append(
+                                        "\nReview required — approve to promote to ready "
+                                        "and respawn worker."
+                                    )
+                                lines.append("")
+                                lines.append(f"Approve:  /kanban approve {sub['task_id']}")
+                                lines.append(f"Deny:     /kanban deny {sub['task_id']} \"reason\"")
+                                lines.append(f"Details:  /kanban show {sub['task_id']}")
+                                msg = "\n".join(lines)
+                            else:
+                                msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
                         elif kind == "gave_up":
                             err = ""
                             if ev.payload and ev.payload.get("error"):
@@ -488,14 +543,34 @@ class GatewayKanbanWatchersMixin:
                                 new_status = str(ev.payload["status"])
                             msg = f"🔄 {board_tag}{tag}Kanban {sub['task_id']} → {new_status}"
                         else:
-                            # archived / unblocked are claimed by TERMINAL_KINDS
-                            # (so the cursor advances past them and they can't
-                            # wedge a later completed/blocked event behind an
-                            # unclaimed row) but are intentionally SILENT: an
-                            # archive needs no user ping, and unblocked is an
-                            # internal transition. They are also excluded from
-                            # _WAKE_KINDS below, so they never wake the creator.
+                            # archived / approval_requested / unblocked are
+                            # claimed by TERMINAL_KINDS (so the cursor advances
+                            # past them and they can't wedge a later
+                            # completed/blocked event behind an unclaimed row)
+                            # but are intentionally SILENT: an archive needs
+                            # no user ping, approval_requested is redundant
+                            # with the enriched blocked message above, and
+                            # unblocked is an internal transition. They are
+                            # also excluded from _WAKE_KINDS below, so they
+                            # never wake the creator.
                             continue
+                        # Auto-subscribe on human-review blocks if enabled
+                        if is_approval_block and kind == "blocked":
+                            try:
+                                self._kanban_auto_subscribe(
+                                    conn,
+                                    task_id=sub["task_id"],
+                                    platform=platform_str,
+                                    chat_id=sub["chat_id"],
+                                    thread_id=sub.get("thread_id"),
+                                    board=board_slug,
+                                    auto_subscribe_cfg=auto_subscribe_enabled,
+                                )
+                            except Exception as _as_exc:
+                                logger.warning(
+                                    "kanban notifier: auto-subscribe check failed for %s: %s",
+                                    sub["task_id"], _as_exc,
+                                )
                         metadata: dict[str, Any] = {}
                         if sub.get("thread_id"):
                             metadata["thread_id"] = sub["thread_id"]
@@ -733,6 +808,84 @@ class GatewayKanbanWatchersMixin:
             )
         finally:
             conn.close()
+
+    def _kanban_auto_subscribe(
+        self,
+        conn,
+        task_id: str,
+        platform: str,
+        chat_id: str,
+        thread_id: Optional[str],
+        board: Optional[str],
+        auto_subscribe_cfg: bool,
+    ) -> bool:
+        """Auto-subscribe the creator's home channel when a task blocks for human review.
+
+        Called when a blocked event has a human-review kind (needs_input, capability,
+        review-required). If the task has no existing subscriptions for this platform/chat,
+        and auto_subscribe is enabled in config, creates a subscription so the user
+        receives the approval notification without manual /kanban subscribe.
+
+        Returns True if a new subscription was created, False otherwise.
+        """
+        from hermes_cli import kanban_db as _kb
+
+        if not auto_subscribe_cfg:
+            return False
+
+        # Check if there are any existing subscriptions for this task
+        existing_subs = _kb.list_notify_subs(conn, task_id=task_id)
+        if not existing_subs:
+            # No subscriptions at all - auto-subscribe
+            try:
+                _kb.add_notify_sub(
+                    conn,
+                    task_id=task_id,
+                    platform=platform,
+                    chat_id=chat_id,
+                    thread_id=thread_id or "",
+                    notifier_profile=self._active_profile_name(),
+                )
+                logger.info(
+                    "kanban notifier: auto-subscribed %s/%s to task %s on board %s",
+                    platform, chat_id, task_id, board,
+                )
+                return True
+            except Exception as exc:
+                logger.warning(
+                    "kanban notifier: auto-subscribe failed for %s: %s",
+                    task_id, exc,
+                )
+                return False
+        else:
+            # Check if any existing subscription matches this platform/chat
+            for sub in existing_subs:
+                if (sub.get("platform") == platform and
+                    sub.get("chat_id") == chat_id and
+                    (sub.get("thread_id") or "") == (thread_id or "")):
+                    # Already subscribed - no action needed
+                    return False
+            # Different subscription exists - auto-subscribe this one too
+            try:
+                _kb.add_notify_sub(
+                    conn,
+                    task_id=task_id,
+                    platform=platform,
+                    chat_id=chat_id,
+                    thread_id=thread_id or "",
+                    notifier_profile=self._active_profile_name(),
+                )
+                logger.info(
+                    "kanban notifier: auto-subscribed %s/%s to task %s on board %s",
+                    platform, chat_id, task_id, board,
+                )
+                return True
+            except Exception as exc:
+                logger.warning(
+                    "kanban notifier: auto-subscribe failed for %s: %s",
+                    task_id, exc,
+                )
+                return False
 
     async def _deliver_kanban_artifacts(
         self,

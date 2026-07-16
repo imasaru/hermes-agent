@@ -806,6 +806,9 @@ class TelegramAdapter(BasePlatformAdapter):
         # Clarify button state: clarify_id → session_key (for the clarify tool's
         # multiple-choice prompts; see GatewayRunner clarify_callback wiring).
         self._clarify_state: Dict[str, str] = {}
+        # Kanban approval button state: approval_id → session_key (for kanban
+        # approve/deny inline buttons; see GatewayRunner kanban_watchers).
+        self._kanban_approval_state: Dict[int, str] = {}
         # Notification mode for message sends.
         # "important" — only final responses, approvals, and slash confirmations
         #               trigger notifications; tool progress, streaming, status
@@ -5126,6 +5129,84 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] send_slash_confirm failed: %s", self.name, _redact_telegram_error_text(e))
             return SendResult(success=False, error=_redact_telegram_error_text(e))
 
+    async def send_kanban_approval(
+        self, chat_id: str, task_id: str, task_title: str,
+        block_kind: str, reason: str, session_key: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send an inline-keyboard kanban approval prompt with approve/deny buttons.
+
+        The buttons call the kanban approve/deny handlers to unblock the task.
+        """
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+
+        try:
+            # Build the notification text
+            lines = [
+                f"⏸ <b>Kanban Task Blocked</b>",
+                f"<code>{task_id}</code>",
+            ]
+            if task_title:
+                lines.append(f"<b>{_html.escape(task_title)}</b>")
+            lines.append(f"Block kind: <code>{_html.escape(block_kind)}</code>")
+            if reason:
+                lines.append(f"Reason: {_html.escape(reason[:500])}")
+            lines.append("")
+            lines.append("Review required — approve to promote to ready and respawn worker.")
+            lines.append("")
+            lines.append("Choose an action below or use the slash commands:")
+            lines.append("  <code>/kanban approve {task_id}</code>")
+            lines.append("  <code>/kanban deny {task_id} "reason"</code>")
+
+            text = "\n".join(lines)
+
+            # Generate a short approval ID using a counter
+            import itertools
+            if not hasattr(self, "_kanban_approval_counter"):
+                self._kanban_approval_counter = itertools.count(1)
+            approval_id = next(self._kanban_approval_counter)
+
+            # Build inline keyboard with approve/deny buttons
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ Approve", callback_data=f"ka:approve:{approval_id}:{task_id}"),
+                    InlineKeyboardButton("❌ Deny", callback_data=f"ka:deny:{approval_id}:{task_id}"),
+                ],
+            ])
+
+            # Resolve thread context
+            thread_id = self._metadata_thread_id(metadata)
+
+            kwargs: Dict[str, Any] = {
+                "chat_id": normalize_telegram_chat_id(chat_id),
+                "text": text,
+                "parse_mode": ParseMode.HTML,
+                "reply_markup": keyboard,
+                **self._link_preview_kwargs(),
+            }
+            reply_to_id = self._reply_to_message_id_for_send(None, metadata, reply_to_mode=self._reply_to_mode)
+            kwargs["reply_to_message_id"] = reply_to_id
+            kwargs.update(
+                self._thread_kwargs_for_send(
+                    chat_id,
+                    thread_id,
+                    metadata,
+                    reply_to_message_id=reply_to_id,
+                    reply_to_mode=self._reply_to_mode
+                )
+            )
+
+            msg = await self._send_message_with_thread_fallback(**kwargs)
+
+            # Store session_key keyed by approval_id for the callback handler
+            self._kanban_approval_state[approval_id] = session_key
+
+            return SendResult(success=True, message_id=str(msg.message_id))
+        except Exception as e:
+            logger.warning("[%s] send_kanban_approval failed: %s", self.name, e)
+            return SendResult(success=False, error=str(e))
+
     async def send_clarify(
         self,
         chat_id: str,
@@ -6087,6 +6168,96 @@ class TelegramAdapter(BasePlatformAdapter):
                         await self._send_message_with_thread_fallback(**send_kwargs)
                 except Exception as exc:
                     logger.error("[%s] slash-confirm callback failed: %s", self.name, exc, exc_info=True)
+            return
+
+        # --- Kanban approval callbacks (ka:approve|deny:approval_id:task_id[:board]) ---
+        # Buttons sent by send_kanban_approval for human-review blocked tasks.
+        # Routes directly to DB approve/deny (no live agent thread to resume).
+        if data.startswith("ka:"):
+            parts = data.split(":")
+            if len(parts) >= 4:
+                choice = parts[1]  # "approve" or "deny"
+                try:
+                    approval_id = int(parts[2])
+                except (ValueError, IndexError):
+                    await query.answer(text="Invalid kanban approval data.")
+                    return
+                task_id = parts[3]
+                board = parts[4] if len(parts) > 4 and parts[4] else None
+
+                caller_id = str(getattr(query.from_user, "id", ""))
+                if not self._is_callback_user_authorized(
+                    caller_id,
+                    chat_id=query_chat_id,
+                    chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                    thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                    user_name=query_user_name,
+                ):
+                    await query.answer(text="⛔ You are not authorized to approve kanban tasks.")
+                    return
+
+                # Pop to mark as consumed (prevents replay of old buttons)
+                stored = self._kanban_approval_state.pop(approval_id, None)
+                if not stored:
+                    await query.answer(text="This kanban approval has already been resolved.")
+                    return
+
+                user_display = getattr(query.from_user, "first_name", "User")
+                label = "✅ Approved" if choice == "approve" else "❌ Denied"
+                await query.answer(text=label)
+
+                # Edit the original message to show the decision and strip buttons
+                try:
+                    await query.edit_message_text(
+                        text=self.format_message(f"{label} kanban {task_id} by {user_display}"),
+                        parse_mode=ParseMode.MARKDOWN_V2,
+                        reply_markup=None,
+                    )
+                except Exception:
+                    pass
+
+                # Execute via DB (actor recorded for audit; board may be default)
+                try:
+                    from hermes_cli import kanban_db as _kb
+                    conn = _kb.connect(board=board)
+                    try:
+                        actor = f"telegram:{caller_id} ({user_display})"
+                        if choice == "approve":
+                            ok, msg = _kb.approve_task(conn, task_id, actor=actor, reason=None)
+                            confirm = f"✓ Approved {task_id}. Worker will respawn with this feedback in context."
+                        else:
+                            ok, msg = _kb.deny_task(conn, task_id, actor=actor, reason=None)
+                            confirm = f"✓ Denied {task_id}. Feedback recorded; task remains blocked."
+                        logger.info(
+                            "Telegram kanban button %s for %s (board=%s, actor=%s): %s",
+                            choice, task_id, board or "default", actor, msg,
+                        )
+                        # Short confirmation follow-up in the same thread (best effort)
+                        if ok and query.message:
+                            try:
+                                thread_id = getattr(query.message, "message_thread_id", None)
+                                send_kwargs = {
+                                    "chat_id": int(query.message.chat_id),
+                                    "text": self.format_message(confirm),
+                                    "parse_mode": ParseMode.MARKDOWN_V2,
+                                    **self._link_preview_kwargs(),
+                                }
+                                if thread_id:
+                                    send_kwargs.update(
+                                        self._thread_kwargs_for_send(
+                                            str(query.message.chat_id),
+                                            str(thread_id),
+                                            {"thread_id": str(thread_id)},
+                                            reply_to_mode=self._reply_to_mode,
+                                        )
+                                    )
+                                await self._send_message_with_thread_fallback(**send_kwargs)
+                            except Exception:
+                                pass  # non-fatal
+                    finally:
+                        conn.close()
+                except Exception as exc:
+                    logger.error("Failed to apply kanban %s from Telegram button for %s: %s", choice, task_id, exc)
             return
 
         # --- Clarify callbacks (cl:clarify_id:idx | cl:clarify_id:other) ---

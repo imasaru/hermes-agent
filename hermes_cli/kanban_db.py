@@ -122,7 +122,12 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # ``BLOCK_RECURRENCE_LIMIT``) escalates them to ``triage`` if a cron keeps
 # unblocking them only to have the worker re-block for the same reason.
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
-VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient", "review-required"}
+
+# Kinds that require human review/approval (not dependency — those auto-route
+# to todo). Used by the notifier to surface rich approval UI and by
+# block_task to emit approval_requested events.
+HUMAN_REVIEW_KINDS = {"needs_input", "capability", "review-required"}
 
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
@@ -136,6 +141,37 @@ VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
+
+
+def parse_block_kind(
+    reason: Optional[str], kind: Optional[str] = None
+) -> tuple[Optional[str], Optional[str]]:
+    """If no explicit ``kind`` and ``reason`` is prefixed with a VALID_BLOCK_KIND + ":",
+    e.g. "review-required: please review the ACL", return (the_kind, stripped_desc).
+
+    The prefix is stripped from the returned reason so that the human-readable
+    description is clean while ``kind`` is populated for routing, loop-breaking,
+    and UI (notifications, show/list, approval flows).
+
+    Explicit ``kind`` always wins (no auto-detect, reason left as-is).
+    This supports ergonomic CLI: `hermes kanban block t123 "review-required: msg"`
+    and equivalent tool calls without forcing a separate kind argument.
+    """
+    if kind is not None:
+        return kind, reason
+    if not reason:
+        return None, reason
+    r = str(reason).strip()
+    if not r:
+        return None, None
+    lower_r = r.lower()
+    for k in VALID_BLOCK_KINDS:
+        p = (k + ":").lower()
+        if lower_r.startswith(p):
+            prefix_len = len(k) + 1
+            rest = r[prefix_len:].strip()
+            return k, (rest if rest else None)
+    return None, r
 
 
 def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:
@@ -4950,6 +4986,7 @@ def block_task(
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
     """
+    kind, reason = parse_block_kind(reason, kind)
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
@@ -5118,6 +5155,18 @@ def block_task(
                 {"reason": reason, "kind": kind, "recurrences": recurrences},
                 run_id=run_id,
             )
+            # Emit approval_requested for human-review kinds so the notifier
+            # can surface rich approval UI (commands/buttons) to subscribers.
+            if kind in HUMAN_REVIEW_KINDS:
+                _append_event(
+                    conn, task_id, "approval_requested",
+                    {
+                        "reason": reason,
+                        "kind": kind,
+                        "recurrences": recurrences,
+                    },
+                    run_id=run_id,
+                )
         _blocked_task = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_blocked",

@@ -4620,16 +4620,10 @@ class GatewaySlashCommandsMixin:
         session_key = self._session_key_for_source(source)
 
         from tools.approval import (
-            resolve_gateway_approval, has_blocking_approval,
+            resolve_gateway_approval, has_blocking_approval, resolve_kanban_permission_approvals,
         )
 
-        if not has_blocking_approval(session_key):
-            if session_key in self._pending_approvals:
-                self._pending_approvals.pop(session_key)
-                return t("gateway.approval_expired")
-            return t("gateway.approve.no_pending")
-
-        # Parse args: support "all", "all session", "all always", "session", "always"
+        # Parse args early so we can use choice for both regular and kanban permission approvals (t_bb012ceb)
         args = event.get_command_args().strip().lower().split()
         resolve_all = "all" in args
         remaining = [a for a in args if a != "all"]
@@ -4641,8 +4635,24 @@ class GatewaySlashCommandsMixin:
         else:
             choice = "once"
 
+        if not has_blocking_approval(session_key):
+            if session_key in self._pending_approvals:
+                self._pending_approvals.pop(session_key)
+                return t("gateway.approval_expired")
+            # kanban permission approvals (t_bb012ceb): resolve via shared pending file
+            # (user sees notification via kanban comment/event; this bypasses manual board comments)
+            kcount = resolve_kanban_permission_approvals(choice)
+            if kcount:
+                logger.info("Resolved %d kanban permission approval(s) via /approve (%s)", kcount, choice)
+                plural = "plural" if kcount > 1 else "singular"
+                return t(f"gateway.approve.{choice}_{plural}", count=kcount)
+            return t("gateway.approve.no_pending")
+
         count = resolve_gateway_approval(session_key, choice, resolve_all=resolve_all)
-        if not count:
+        # also resolve any concurrent kanban ones
+        kcount = resolve_kanban_permission_approvals(choice)
+        total = count + kcount
+        if not total:
             return t("gateway.approve.no_pending")
 
         # Resume typing indicator — agent is about to continue processing.
@@ -4669,13 +4679,17 @@ class GatewaySlashCommandsMixin:
         session_key = self._session_key_for_source(source)
 
         from tools.approval import (
-            resolve_gateway_approval, has_blocking_approval,
+            resolve_gateway_approval, has_blocking_approval, resolve_kanban_permission_approvals,
         )
 
         if not has_blocking_approval(session_key):
             if session_key in self._pending_approvals:
                 self._pending_approvals.pop(session_key)
                 return t("gateway.deny.stale")
+            # kanban permission deny support (t_bb012ceb)
+            kcount = resolve_kanban_permission_approvals("deny")
+            if kcount:
+                return "Denied kanban permission request(s) via gateway."
             return t("gateway.deny.no_pending")
 
         # Parse args: a leading "all" token denies every pending command;

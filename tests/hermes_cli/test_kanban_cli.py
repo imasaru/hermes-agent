@@ -155,7 +155,10 @@ def test_run_slash_block_unblock_cycle(kanban_home):
     tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
     # Claim first so block() finds it running
     kc.run_slash(f"claim {tid}")
-    assert "Blocked" in kc.run_slash(f"block {tid} 'need decision'")
+    # Use --kind to set block_kind (enables structured detection in show/list)
+    assert "Blocked" in kc.run_slash(f"block {tid} 'need decision' --kind review-required")
+    show = kc.run_slash(f"show {tid}")
+    assert "block_kind: review-required" in show
     assert "Unblocked" in kc.run_slash(f"unblock {tid}")
 
 

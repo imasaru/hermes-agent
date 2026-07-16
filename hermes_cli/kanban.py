@@ -54,7 +54,11 @@ def _fmt_task_line(t: kb.Task) -> str:
     icon = _STATUS_ICONS.get(t.status, "?")
     assignee = t.assignee or "(unassigned)"
     tenant = f" [{t.tenant}]" if t.tenant else ""
-    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}"
+    block = ""
+    if t.block_kind:
+        rec = f" x{t.block_recurrences}" if t.block_recurrences else ""
+        block = f" [{t.block_kind}{rec}]"
+    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}{block}  {t.title}"
 
 
 def _task_to_dict(t: kb.Task) -> dict[str, Any]:
@@ -80,6 +84,8 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
+        "block_kind": t.block_kind,
+        "block_recurrences": t.block_recurrences,
     }
 
 
@@ -1559,6 +1565,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
     print(f"Task {task.id}: {task.title}")
     print(f"  status:    {task.status}")
     print(f"  assignee:  {task.assignee or '-'}")
+    if task.block_kind:
+        print(f"  block_kind: {task.block_kind} (recurrences: {task.block_recurrences})")
     if task.tenant:
         print(f"  tenant:    {task.tenant}")
     print(f"  workspace: {task.workspace_kind}" +
@@ -2926,6 +2934,8 @@ Common subcommands:
   `attach <id> <path>`  Attach a local file; `attachments <id>` to list
   `complete <id>…`      Mark task(s) done
   `block <id> [reason]` Mark blocked; `schedule <id> [reason]` parks time-delay work; `unblock <id>` to revive
+  `approve <id>…`      Approve a blocked task (audit comment + unblock)
+  `deny <id>…`         Deny a blocked task (audit comment, stays blocked)
   `assign <id> <profile>`  Reassign
   `boards list`         Show all boards
   `assignees`           Known profiles + counts
