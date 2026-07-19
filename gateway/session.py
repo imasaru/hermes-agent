@@ -17,7 +17,7 @@ import threading
 import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dataclasses_replace
 from typing import Dict, List, Optional, Any
 
 logger = logging.getLogger(__name__)
@@ -2493,6 +2493,91 @@ class SessionStore:
             for entry in self._entries.values():
                 if entry.session_id == session_id:
                     return entry
+        return None
+
+    def rekey_session_for_new_thread(
+        self,
+        old_session_key: str,
+        new_thread_id: str,
+    ) -> Optional[tuple]:
+        """Move a routing entry when the platform thread/topic name changes.
+
+        Used when a Zulip stream topic is renamed: Hermes keys sessions on the
+        topic string (``thread_id``), so the routing index must move from the
+        old key to the new one without ending the conversation.
+
+        Returns ``(entry, new_session_key)`` on success, or ``None`` when the
+        rekey is a no-op / unsafe (missing entry, collision with another
+        session). Failures never raise — callers log and continue.
+        """
+        if not old_session_key or not new_thread_id:
+            return None
+        new_thread_id = str(new_thread_id).strip()
+        if not new_thread_id:
+            return None
+
+        new_entry = None
+        new_session_key = None
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(old_session_key)
+            if entry is None:
+                return None
+            origin = entry.origin
+            if origin is None:
+                return None
+            old_thread = str(origin.thread_id or "")
+            if old_thread == new_thread_id and entry.session_key == old_session_key:
+                return (entry, old_session_key)
+
+            try:
+                new_origin = dataclasses_replace(
+                    origin,
+                    thread_id=new_thread_id,
+                    chat_topic=new_thread_id,
+                )
+            except Exception:
+                # Fallback if SessionSource is not a real dataclass in tests
+                new_origin = origin
+                try:
+                    new_origin.thread_id = new_thread_id
+                    if hasattr(new_origin, "chat_topic"):
+                        new_origin.chat_topic = new_thread_id
+                except Exception:
+                    return None
+
+            new_session_key = self._generate_session_key(new_origin)
+            if not new_session_key:
+                return None
+
+            if new_session_key != old_session_key:
+                existing = self._entries.get(new_session_key)
+                if existing is not None and existing.session_id != entry.session_id:
+                    logger.warning(
+                        "gateway.session: refuse Zulip/topic rekey %r -> %r; "
+                        "target key already bound to session %s",
+                        old_session_key,
+                        new_session_key,
+                        existing.session_id,
+                    )
+                    return None
+                self._entries.pop(old_session_key, None)
+
+            entry.session_key = new_session_key
+            entry.origin = new_origin
+            entry.updated_at = _now()
+            self._entries[new_session_key] = entry
+            new_entry = entry
+            self._save()
+
+        if new_entry is not None and new_session_key is not None:
+            self._record_gateway_session_peer(
+                new_entry.session_id,
+                new_session_key,
+                new_entry.origin,
+                display_name=new_entry.display_name,
+            )
+            return (new_entry, new_session_key)
         return None
 
     def peek_session_id(self, session_key: str) -> Optional[str]:

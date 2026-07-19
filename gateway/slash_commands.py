@@ -3759,6 +3759,20 @@ class GatewaySlashCommandsMixin:
                                 "Failed to rename Telegram topic from /title",
                                 exc_info=True,
                             )
+                    # Zulip stream topics use the topic string as Hermes
+                    # thread_id — keep the visible topic aligned with /title
+                    # and rekey session routing on success (adapter.rename_topic).
+                    schedule_zulip = getattr(
+                        self, "_schedule_zulip_topic_title_rename", None
+                    )
+                    if callable(schedule_zulip):
+                        try:
+                            await asyncio.to_thread(schedule_zulip, source, session_id, sanitized)
+                        except Exception:
+                            logger.debug(
+                                "Failed to rename Zulip topic from /title",
+                                exc_info=True,
+                            )
                     return t("gateway.title.set_to", title=sanitized)
                 else:
                     return t("gateway.title.not_found")

@@ -5730,21 +5730,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             from tools.approval import has_blocking_approval
             if has_blocking_approval(session_key):
+                # Exact-token forms (legacy #46866) plus kanban-parity cues
+                # like ``lgtm!`` / ``lgtm — note`` when a dangerous command
+                # is actually pending. Trailing notes are ignored on approve
+                # (session-scoped once; no board thread to attach) and are
+                # relayed as ``/deny <reason>`` on deny so the agent can adapt.
                 _raw_text = (event.text or "").strip().lower()
-                _approve_words = {"approve", "yes", "ok", "okay", "confirm", "y", "👍"}
-                _deny_words = {"deny", "no", "reject", "cancel", "n", "👎"}
                 _approval_handler = None
                 _normalized_args = ""
-                if _raw_text in _approve_words:
-                    _approval_handler = self._handle_approve_command
-                elif _raw_text in _deny_words:
-                    _approval_handler = self._handle_deny_command
-                elif _raw_text in {"always", "approve always", "always approve"}:
+                if _raw_text in {"always", "approve always", "always approve"}:
                     _approval_handler = self._handle_approve_command
                     _normalized_args = "always"
                 elif _raw_text in {"session", "approve session", "session approve"}:
                     _approval_handler = self._handle_approve_command
                     _normalized_args = "session"
+                else:
+                    _parsed = None
+                    try:
+                        _parsed = self._parse_kanban_natural_decision(
+                            event.text or ""
+                        )
+                    except Exception:
+                        _parsed = None
+                    if _parsed:
+                        _pverb, _pcomment = _parsed
+                        if _pverb == "approve":
+                            _approval_handler = self._handle_approve_command
+                            # Optional note is session-local only — log it;
+                            # dangerous once-approve has no board comment sink.
+                            if _pcomment:
+                                logger.info(
+                                    "Dangerous-command plain approve note "
+                                    "(not persisted): session=%s note=%r",
+                                    session_key, _pcomment,
+                                )
+                        elif _pverb == "deny":
+                            _approval_handler = self._handle_deny_command
+                            _normalized_args = (_pcomment or "").strip()
                 if _approval_handler is not None:
                     # Synthesize the canonical "/approve [args]" / "/deny"
                     # command text so the slash handlers parse modifiers via
@@ -15182,6 +15204,217 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         future.add_done_callback(_log_rename_failure)
 
+    def _is_zulip_topic_lane(self, source: SessionSource) -> bool:
+        """True for a Zulip stream message that carries a topic (thread_id).
+
+        DMs are excluded — Zulip private messages have no renameable topic, and
+        ``ZulipAdapter.rename_topic`` no-ops on ``dm:`` chat ids.
+        """
+        platform = getattr(source, "platform", None)
+        platform_value = getattr(platform, "value", platform)
+        if str(platform_value or "").lower() != "zulip":
+            return False
+        chat_id = str(getattr(source, "chat_id", None) or "")
+        if getattr(source, "chat_type", None) == "dm" or chat_id.startswith("dm:"):
+            return False
+        return bool(getattr(source, "thread_id", None))
+
+    def _sanitize_zulip_topic_title(
+        self,
+        title: str,
+        *,
+        old_topic: Optional[str] = None,
+    ) -> str:
+        """Return a Zulip-safe topic name (max 60 chars) from a session title.
+
+        When *old_topic* begins with a stable kanban-style prefix
+        (``t_<hex> — ``), keep that prefix so approval/subscription topics stay
+        findable after a semantic rename.
+        """
+        cleaned = re.sub(r"\s+", " ", str(title or "")).strip()
+        prefix = ""
+        if old_topic:
+            m = re.match(r"^(t_[0-9a-fA-F]+)\s*[—–\-]\s*", str(old_topic))
+            if m:
+                prefix = f"{m.group(1)} — "
+                cleaned = re.sub(
+                    rf"^{re.escape(m.group(1))}\s*[—–\-]\s*",
+                    "",
+                    cleaned,
+                ).strip()
+        if not cleaned:
+            cleaned = "Hermes Chat"
+        budget = 60 - len(prefix)
+        if budget <= 0:
+            return (prefix + cleaned)[:60]
+        if len(cleaned) > budget:
+            if budget <= 3:
+                cleaned = cleaned[:budget]
+            else:
+                cleaned = cleaned[: budget - 3].rstrip() + "..."
+        return (prefix + cleaned)[:60]
+
+    def _rekey_runtime_session_maps(self, old_key: str, new_key: str) -> None:
+        """Move in-memory gateway dicts keyed by session_key after a topic rename."""
+        if not old_key or not new_key or old_key == new_key:
+            return
+
+        def _move(mapping) -> None:
+            if not isinstance(mapping, dict):
+                return
+            if old_key in mapping and new_key not in mapping:
+                mapping[new_key] = mapping.pop(old_key)
+
+        for attr in (
+            "_running_agents",
+            "_running_agents_ts",
+            "_busy_ack_ts",
+            "_session_model_overrides",
+            "_session_reasoning_overrides",
+            "_pending_model_notes",
+            "_pending_messages",
+            "_update_prompt_pending",
+        ):
+            try:
+                _move(getattr(self, attr, None))
+            except Exception:
+                logger.debug(
+                    "Failed to rekey %s after topic rename %r -> %r",
+                    attr,
+                    old_key,
+                    new_key,
+                    exc_info=True,
+                )
+
+        cache = getattr(self, "_agent_cache", None)
+        if isinstance(cache, dict) and old_key in cache and new_key not in cache:
+            lock = getattr(self, "_agent_cache_lock", None)
+            try:
+                if lock is not None:
+                    with lock:
+                        if old_key in cache and new_key not in cache:
+                            cache[new_key] = cache.pop(old_key)
+                else:
+                    cache[new_key] = cache.pop(old_key)
+            except Exception:
+                logger.debug(
+                    "Failed to rekey agent cache after topic rename %r -> %r",
+                    old_key,
+                    new_key,
+                    exc_info=True,
+                )
+
+    async def _rename_zulip_topic_for_session_title(
+        self,
+        source: SessionSource,
+        session_id: str,
+        title: str,
+    ) -> None:
+        """Best-effort rename of a Zulip stream topic when a session is titled.
+
+        On success, rekeys the Hermes session store so the next inbound message
+        (which carries the new topic as ``thread_id``) stays on the same
+        session. Failures are logged only — never user-facing.
+        """
+        if not self._is_zulip_topic_lane(source) or not source.chat_id or not source.thread_id:
+            return
+        old_topic = str(source.thread_id)
+        new_topic = self._sanitize_zulip_topic_title(title, old_topic=old_topic)
+        if not new_topic or new_topic == old_topic:
+            return
+
+        adapter = self._adapter_for_source(source)
+        if adapter is None:
+            return
+        rename_topic = getattr(adapter, "rename_topic", None)
+        if rename_topic is None:
+            return
+
+        try:
+            ok = await rename_topic(
+                chat_id=str(source.chat_id),
+                old_topic=old_topic,
+                new_topic=new_topic,
+            )
+        except Exception:
+            logger.debug(
+                "Failed to rename Zulip topic for session title",
+                exc_info=True,
+            )
+            return
+        if not ok:
+            return
+
+        old_key = self._session_key_for_source(source)
+        store = getattr(self, "session_store", None)
+        if store is None or not old_key:
+            return
+        try:
+            result = await asyncio.to_thread(
+                store.rekey_session_for_new_thread,
+                old_key,
+                new_topic,
+            )
+        except Exception:
+            logger.debug(
+                "Failed to rekey session after Zulip topic rename",
+                exc_info=True,
+            )
+            return
+        if not result:
+            return
+        _entry, new_key = result
+        try:
+            self._rekey_runtime_session_maps(old_key, new_key)
+        except Exception:
+            logger.debug(
+                "Failed to rekey runtime maps after Zulip topic rename",
+                exc_info=True,
+            )
+        # Keep the caller's source in sync for any same-turn follow-up delivery.
+        try:
+            source.thread_id = new_topic
+            if hasattr(source, "chat_topic"):
+                source.chat_topic = new_topic
+        except Exception:
+            pass
+
+    def _schedule_zulip_topic_title_rename(
+        self,
+        source: SessionSource,
+        session_id: str,
+        title: str,
+    ) -> None:
+        """Schedule a Zulip topic rename from the auto-title background thread."""
+        if not title or not self._is_zulip_topic_lane(source):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = getattr(self, "_gateway_loop", None)
+        if loop is None or loop.is_closed():
+            return
+        try:
+            copied_source = dataclasses.replace(source)
+        except Exception:
+            copied_source = source
+        future = safe_schedule_threadsafe(
+            self._rename_zulip_topic_for_session_title(copied_source, session_id, title),
+            loop,
+            logger=logger,
+            log_message="Zulip topic title rename failed to schedule",
+        )
+        if future is None:
+            return
+
+        def _log_rename_failure(fut) -> None:
+            try:
+                fut.result()
+            except Exception:
+                logger.debug("Zulip topic title rename failed", exc_info=True)
+
+        future.add_done_callback(_log_rename_failure)
+
     _TELEGRAM_CAPABILITY_HINT_COOLDOWN_S = 300.0
 
     def _should_send_telegram_capability_hint(self, source: SessionSource) -> bool:
@@ -21090,6 +21323,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                     elif self._is_discord_auto_thread_lane(source):
                         maybe_auto_title_kwargs["title_callback"] = lambda title: self._schedule_discord_semantic_thread_rename(
+                            source,
+                            effective_session_id,
+                            title,
+                        )
+                    elif self._is_zulip_topic_lane(source):
+                        maybe_auto_title_kwargs["title_callback"] = lambda title: self._schedule_zulip_topic_title_rename(
                             source,
                             effective_session_id,
                             title,
