@@ -5134,3 +5134,58 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ---------------------------------------------------------------------------
+# Gateway approve/deny (nested write_txn regression)
+# ---------------------------------------------------------------------------
+
+def test_approve_task_nested_write_txn_succeeds(kanban_home):
+    """approve_task used to nest write_txn(add_comment/unblock) and crash.
+
+    Regression for: sqlite3.OperationalError: cannot start a transaction
+    within a transaction — which blocked bare /approve on Zulip.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="needs review", assignee="coder")
+        assert kb.block_task(
+            conn, tid, reason="please look", kind="review-required",
+        )
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.block_kind == "review-required"
+
+        ok, msg = kb.approve_task(conn, tid, actor="macmini", reason="lgtm")
+        assert ok, msg
+        task = kb.get_task(conn, tid)
+        assert task.status in ("ready", "todo")
+
+        events = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id=? ORDER BY id",
+            (tid,),
+        ).fetchall()
+        kinds = [r["kind"] for r in events]
+        assert "approved" in kinds
+        assert "unblocked" in kinds
+        # payload carries original block kind
+        import json
+        approved = [json.loads(r["payload"]) for r in events if r["kind"] == "approved"]
+        assert approved and approved[-1].get("kind") == "review-required"
+        assert approved[-1].get("actor") == "macmini"
+
+
+def test_deny_task_keeps_blocked_and_records_event(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="needs work", assignee="coder")
+        assert kb.block_task(conn, tid, reason="nits", kind="review-required")
+        ok, msg = kb.deny_task(conn, tid, actor="macmini", reason="fix tests")
+        assert ok, msg
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        kinds = [
+            r["kind"]
+            for r in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id=?", (tid,),
+            )
+        ]
+        assert "denied" in kinds
