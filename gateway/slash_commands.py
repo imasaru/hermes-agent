@@ -4842,6 +4842,133 @@ class GatewaySlashCommandsMixin:
             logger.warning("kanban natural %s failed: %s", verb, exc)
             return f"Failed to {verb} {task_id}: {exc}"
 
+
+    async def try_handle_kanban_topic_note(
+        self, event: MessageEvent,
+    ) -> Optional[str]:
+        """Option A: free-text in a ``t_<id>`` topic becomes a kanban comment.
+
+        Approve/deny cues are handled by ``try_handle_kanban_natural_decision``
+        first. Any other non-command text in a kanban approval topic is
+        mirrored onto the task thread and acked in-chat — **without** starting
+        the gateway profile agent (which would answer with the wrong model/
+        context).
+
+        Escape hatch (talk to the gateway agent in-topic anyway):
+          - message starts with ``@agent`` / ``@hermes`` / ``agent:`` / ``chat:``
+        """
+        from tools.approval import has_blocking_approval
+
+        source = event.source
+        session_key = self._session_key_for_source(source)
+        if has_blocking_approval(session_key):
+            return None
+
+        raw = (event.text or "").strip()
+        if not raw:
+            return None
+
+        # Slash commands are handled earlier; belt-and-suspenders.
+        if raw.startswith("/"):
+            return None
+
+        # Escape hatch → normal gateway agent conversation
+        low = raw.lower()
+        for prefix in ("@agent", "@hermes", "agent:", "chat:"):
+            if low.startswith(prefix):
+                return None
+
+        thread = (
+            getattr(source, "thread_id", None)
+            or getattr(source, "chat_topic", None)
+            or ""
+        )
+        m = re.match(r"(t_[a-f0-9]{6,})", str(thread).strip())
+        if not m:
+            return None
+        task_id = m.group(1)
+
+        def _resolve():
+            from hermes_cli import kanban_db as _kb
+            try:
+                boards = _kb.list_boards(include_archived=False)
+            except Exception:
+                boards = [{"slug": getattr(_kb, "DEFAULT_BOARD", "default")}]
+            for b in boards:
+                slug = b.get("slug") or "default"
+                try:
+                    c = _kb.connect(board=slug)
+                except Exception:
+                    continue
+                try:
+                    task = _kb.get_task(c, task_id)
+                    if task is not None:
+                        return slug, task
+                finally:
+                    c.close()
+            return None, None
+
+        try:
+            board, task = await asyncio.to_thread(_resolve)
+        except Exception as exc:
+            logger.warning("kanban topic note resolve failed: %s", exc)
+            return None
+
+        if task is None:
+            # Topic looks like a task id but board has no such task —
+            # don't trap the user; fall through to normal agent.
+            return None
+
+        human = (
+            getattr(source, "user_name", None)
+            or getattr(source, "user_id", None)
+            or "user"
+        )
+        status = getattr(task, "status", None) or "?"
+        title = getattr(task, "title", None) or ""
+
+        try:
+            from hermes_cli.kanban import run_slash
+
+            cmt = (
+                f"comment --author {shlex.quote(str(human))} "
+                f"{task_id} {shlex.quote(raw)}"
+            )
+            if board:
+                cmt = f"--board {board} {cmt}"
+            await asyncio.to_thread(run_slash, cmt)
+        except Exception as exc:
+            logger.warning("kanban topic note comment failed: %s", exc)
+            return (
+                f"Could not attach your note to `{task_id}`: {exc}\n"
+                f"(gateway agent was **not** started — retry or use "
+                f"`@agent <question>` to chat with the home agent.)"
+            )
+
+        logger.info(
+            "Kanban topic note on %s board=%s by %s (status=%s): %r",
+            task_id, board, human, status, raw[:120],
+        )
+
+        title_bit = f" — {title}" if title else ""
+        board_bit = f" on `{board}`" if board else ""
+        lines = [
+            f"📎 Noted on `{task_id}`{title_bit}{board_bit} "
+            f"(status: **{status}**).",
+            "",
+            "Your message was saved as a **task comment** for the assignee "
+            "worker. The home gateway agent was **not** started "
+            "(avoids answering from the wrong profile/model).",
+            "",
+            "Next:",
+            f"- Decide: `lgtm! <notes>` / `deny <reason>` "
+            f"(or `/kanban approve {task_id}`)",
+            f"- Inspect: `/kanban show {task_id}`",
+            "- Chat with home agent in this topic: prefix with "
+            "`@agent ` or `chat: `",
+        ]
+        return "\n".join(lines)
+
     def _find_contextual_kanban_review_tasks(
         self,
         *,

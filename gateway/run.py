@@ -11326,6 +11326,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if _kanban_nl is not None:
             return _kanban_nl
 
+        # Option A: free-text in t_<id> approval topics → kanban comment + ack
+        # (do not start the gateway profile agent on ticket threads).
+        try:
+            _kanban_note = await self.try_handle_kanban_topic_note(event)
+        except Exception as _knote_exc:
+            logger.debug("kanban topic note skipped: %s", _knote_exc)
+            _kanban_note = None
+        if _kanban_note is not None:
+            return _kanban_note
+
         if await asyncio.to_thread(self._is_telegram_topic_root_lobby, source):
             # Debounce the lobby reminder so a user who forgets about
             # topic mode and fires ten prompts doesn't get ten copies.
