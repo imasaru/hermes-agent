@@ -2027,6 +2027,79 @@ _permanent_approved: set = set()
 # resolves every pending approval in the session.
 
 
+def format_dangerous_approval_reply_help(
+    prefix: str = "/",
+    *,
+    allow_permanent: bool = True,
+    smart_denied: bool = False,
+) -> str:
+    """User-facing reply options for a plain-text dangerous-command approval.
+
+    Slash forms use *prefix* (``/`` most platforms; ``!`` on Slack/Matrix
+    typed commands).  Natural-language cues (``yes``, ``lgtm``, ``no``, …)
+    are also accepted when a blocking approval is pending — keep this text
+    in sync with gateway plain-text routing + ``_parse_kanban_natural_decision``.
+
+    When *smart_denied* is True, session/always scopes are hidden because the
+    owner override applies to a single operation only.  When *allow_permanent*
+    is False (e.g. tirith findings), the always option is omitted.
+    """
+    p = prefix or "/"
+    lines = [
+        "**How to reply**",
+        f"• **Once:** `{p}approve` · `yes` · `lgtm` (optional note OK)",
+    ]
+    if not smart_denied:
+        lines.append(f"• **Session:** `{p}approve session` · `session`")
+        if allow_permanent:
+            lines.append(f"• **Always:** `{p}approve always` · `always`")
+    else:
+        lines.append("• Smart DENY: owner override applies to this one operation only")
+    lines.append(f"• **Deny:** `{p}deny` · `no` (optional reason OK)")
+    return "\n".join(lines)
+
+
+def format_dangerous_approval_prompt(
+    command: str,
+    description: str = "dangerous command",
+    *,
+    prefix: str = "/",
+    command_preview_limit: int = 200,
+    heading: str | None = None,
+    extra_footer: str = "",
+    allow_permanent: bool = True,
+    smart_denied: bool = False,
+) -> str:
+    """Full plain-text dangerous-command approval message (command + options)."""
+    cmd = command or ""
+    if command_preview_limit and len(cmd) > command_preview_limit:
+        cmd_preview = cmd[:command_preview_limit] + "..."
+    else:
+        cmd_preview = cmd
+    desc = description or "dangerous command"
+    if heading is None:
+        heading = (
+            "⚠️ **Smart DENY — owner override for one operation:**"
+            if smart_denied
+            else "⚠️ **Dangerous command requires approval:**"
+        )
+    parts = [
+        heading,
+        f"```\n{cmd_preview}\n```",
+        f"Reason: {desc}",
+        "",
+        format_dangerous_approval_reply_help(
+            prefix,
+            allow_permanent=allow_permanent,
+            smart_denied=smart_denied,
+        ),
+    ]
+    body = "\n".join(parts)
+    if extra_footer:
+        body = f"{body}\n\n{extra_footer.lstrip()}"
+    return body
+
+
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
     __slots__ = ("event", "data", "result", "reason")
@@ -3214,6 +3287,13 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         surface=surface,
         choice=_outcome,
     )
+    # Must always return a decision dict — callers (check_all_command_guards,
+    # check_execute_code_guard, _run_approval_gate) call .get("notify_failed")
+    # on the result. Regression: commit 846e678c2 inserted kanban helpers after
+    # this hook and dropped the return, so gateway notify paths returned None
+    # and crashed with AttributeError (t_640d3683).
+    return {"resolved": resolved, "choice": choice, "reason": entry.reason}
+
 
 def _get_kanban_approval_dir() -> "Path":
     """Directory for cross-process kanban permission approval state (shared file for worker <-> gateway)."""
@@ -3253,7 +3333,13 @@ def _forward_kanban_permission_approval(task_id: str, approval_data: dict) -> No
         try:
             cmd = str(approval_data.get("command", ""))[:300]
             desc = str(approval_data.get("description", ""))
-            comment_body = f"[GATEWAY PERMISSION APPROVAL] task {task_id}\nCommand: {cmd}\nDesc: {desc}\n\nReply with /approve (or /kanban approve) to allow this command for the worker. Task ID included for routing."
+            _help = format_dangerous_approval_reply_help("/")
+            comment_body = (
+                f"[GATEWAY PERMISSION APPROVAL] task {task_id}\n"
+                f"Command: {cmd}\nDesc: {desc}\n\n"
+                f"{_help}\n"
+                f"Also: `/kanban approve` (task routing). Task ID included for routing."
+            )
             kb.add_comment(conn, task_id, "gateway:approval-forward", comment_body)
             kb._append_event(conn, task_id, "permission_approval_requested", {
                 "task_id": task_id,

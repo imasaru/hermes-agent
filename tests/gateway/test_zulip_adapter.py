@@ -111,6 +111,9 @@ def _make_adapter(monkeypatch, **extra_kwargs):
     mock_client.send_message = MagicMock(
         return_value={"result": "success", "id": 1}
     )
+    mock_client.update_message = MagicMock(
+        return_value={"result": "success"}
+    )
     mock_client.update_server_settings = MagicMock(
         return_value={"result": "success"}
     )
@@ -740,6 +743,92 @@ class TestPayloadBuilding:
         # Verify the client was called with truncated content
         call_args = adapter.client.send_message.call_args[0][0]
         assert len(call_args["content"]) <= _MAX_MESSAGE_LENGTH
+
+
+# ---------------------------------------------------------------------------
+# Tests: Outbound edit_message (stream consumer progressive drafts)
+# ---------------------------------------------------------------------------
+
+
+class TestEditMessageOutbound:
+    """Outbound edit_message → Zulip client.update_message."""
+
+    def test_edit_message_success(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter.client.update_message = MagicMock(
+            return_value={"result": "success"}
+        )
+        result = asyncio.run(
+            adapter.edit_message("567", "42", "draft growing ▉", finalize=False)
+        )
+        assert result.success is True
+        assert result.message_id == "42"
+        payload = adapter.client.update_message.call_args[0][0]
+        assert payload == {"message_id": 42, "content": "draft growing ▉"}
+
+    def test_edit_message_finalize_accepted(self, monkeypatch):
+        """finalize is BasePlatformAdapter-compat no-op but must not raise."""
+        adapter = _make_adapter(monkeypatch)
+        adapter.client.update_message = MagicMock(
+            return_value={"result": "success"}
+        )
+        result = asyncio.run(
+            adapter.edit_message("567", "7", "final text", finalize=True)
+        )
+        assert result.success is True
+        assert result.message_id == "7"
+
+    def test_edit_message_rejects_empty(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        result = asyncio.run(adapter.edit_message("567", "1", ""))
+        assert result.success is False
+        assert "empty" in (result.error or "").lower()
+        adapter.client.update_message.assert_not_called()
+
+    def test_edit_message_rejects_invalid_id(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        result = asyncio.run(adapter.edit_message("567", "not-int", "x"))
+        assert result.success is False
+        assert "invalid message_id" in (result.error or "")
+        adapter.client.update_message.assert_not_called()
+
+    def test_edit_message_truncates_to_max(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter.client.update_message = MagicMock(
+            return_value={"result": "success"}
+        )
+        long_content = "y" * (_MAX_MESSAGE_LENGTH + 50)
+        result = asyncio.run(adapter.edit_message("567", "9", long_content))
+        assert result.success is True
+        payload = adapter.client.update_message.call_args[0][0]
+        assert len(payload["content"]) == _MAX_MESSAGE_LENGTH
+
+    def test_edit_message_api_error(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter.client.update_message = MagicMock(
+            return_value={"result": "error", "msg": "rate limit exceeded"}
+        )
+        result = asyncio.run(adapter.edit_message("567", "1", "hi"))
+        assert result.success is False
+        assert "rate limit" in (result.error or "").lower()
+        assert result.retryable is True
+
+    def test_edit_message_exception_retryable(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter.client.update_message = MagicMock(
+            side_effect=ConnectionError("network blip")
+        )
+        result = asyncio.run(adapter.edit_message("567", "1", "hi"))
+        assert result.success is False
+        assert result.retryable is True
+        assert "network blip" in (result.error or "")
+
+    def test_edit_overrides_base_so_progress_path_sees_editing(self, monkeypatch):
+        """Gateway skips tool-progress when edit_message is still the base stub."""
+        from gateway.platforms.base import BasePlatformAdapter
+
+        adapter = _make_adapter(monkeypatch)
+        assert type(adapter).edit_message is not BasePlatformAdapter.edit_message
 
 
 # ---------------------------------------------------------------------------

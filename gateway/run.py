@@ -20897,11 +20897,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # typed prefix so Slack/Matrix users are told the form they
                 # can actually type (`!approve`) — typed "/" is blocked in
                 # Slack threads and reserved by Matrix clients.
+                # Include natural-language cues (yes/lgtm/no) so users do not
+                # have to discover them by trial and error.
+                from tools.approval import format_dangerous_approval_prompt
+
                 _p = getattr(_status_adapter, "typed_command_prefix", "/")
-                msg = _format_exec_approval_fallback(
+                msg = format_dangerous_approval_prompt(
                     cmd,
                     desc,
-                    _p,
+                    prefix=_p,
+                    command_preview_limit=200,
                     allow_permanent=approval_data.get("allow_permanent", True),
                     smart_denied=approval_data.get("smart_denied", False),
                 )

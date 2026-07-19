@@ -45,6 +45,16 @@ class TestResolveDisplaySetting:
         assert resolve_display_setting(config, "telegram", "tool_progress") == "off"
         # Email defaults to tier_minimal → "off"
         assert resolve_display_setting(config, "email", "tool_progress") == "off"
+        # Zulip: progressive edit streaming is opt-in (EDITED-tag UX).
+        assert resolve_display_setting(config, "zulip", "streaming") is False
+        assert resolve_display_setting(config, "zulip", "tool_progress") == "off"
+
+    def test_zulip_streaming_opt_in_override(self):
+        """Explicit display.platforms.zulip.streaming: true still wins."""
+        from gateway.display_config import resolve_display_setting
+
+        config = {"display": {"platforms": {"zulip": {"streaming": True}}}}
+        assert resolve_display_setting(config, "zulip", "streaming") is True
 
     def test_global_default_for_unknown_platform(self):
         """Unknown platforms get the global defaults."""

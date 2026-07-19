@@ -2032,22 +2032,21 @@ class MatrixAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         requester_user_id = str((metadata or {}).get("requester_user_id") or "") or None
-        cmd_preview = command[:2000] + "..." if len(command) > 2000 else command
-        scope_choices = ""
-        if smart_denied:
-            scope_choices = "Smart DENY: owner override applies to this one operation only.\n"
-        else:
-            scope_choices = "Reply `!approve session` to approve this pattern for the session, "
-            if allow_permanent:
-                scope_choices += "`!approve always` to approve permanently, "
-        text = (
-            "⚠️ **Dangerous command requires approval**\n"
-            f"```\n{cmd_preview}\n```\n"
-            f"Reason: {description}\n\n"
-            f"{scope_choices}Reply `!approve` to execute once, or `!deny` to cancel.\n\n"
-            "You can also click the reaction to approve:\n"
-            "✅ = approve\n"
-            "❎ = deny"
+        from tools.approval import format_dangerous_approval_prompt
+
+        text = format_dangerous_approval_prompt(
+            command,
+            description,
+            prefix="!",
+            command_preview_limit=2000,
+            heading="⚠️ **Dangerous command requires approval**",
+            extra_footer=(
+                "You can also click the reaction to approve:\n"
+                "✅ = approve\n"
+                "❎ = deny"
+            ),
+            allow_permanent=allow_permanent,
+            smart_denied=smart_denied,
         )
 
         result = await self.send(chat_id, text, metadata=metadata)

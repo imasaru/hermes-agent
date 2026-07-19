@@ -144,6 +144,15 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
     "mattermost":      _TIER_MEDIUM,
     "matrix":          _TIER_MEDIUM,
     "feishu":          _TIER_MEDIUM,
+    # Zulip plugin has real edit_message (update_message), but progressive
+    # stream edits are a poor UX: each update paints EDITED, re-renders
+    # full Markdown, and fans out reader events. Default streaming off;
+    # opt in via display.platforms.zulip.streaming: true if desired.
+    "zulip":           {
+        **_TIER_HIGH,
+        "tool_progress": "off",  # avoid permanent tool spam when streaming off
+        "streaming": False,
+    },
 
     # Tier 3 — no edit support, progress messages are permanent
     "signal":          _TIER_LOW,

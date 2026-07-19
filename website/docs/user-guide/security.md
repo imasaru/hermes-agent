@@ -209,10 +209,14 @@ The four options:
 
 ### Approval Flow (Gateway/Messaging)
 
-On messaging platforms, the agent sends the dangerous command details to the chat and waits for the user to reply:
+On messaging platforms, the agent sends the dangerous command details to the chat and waits for the user to reply. The prompt groups options:
 
-- Reply **yes**, **y**, **approve**, **ok**, or **go** to approve
-- Reply **no**, **n**, **deny**, or **cancel** to deny
+- **Once:** `/approve`, `yes`, `lgtm` (optional note OK) — also `y` / `ok` / `confirm` / `ship it`
+- **Session:** `/approve session` or bare `session`
+- **Always:** `/approve always` or bare `always`
+- **Deny:** `/deny`, `no` (optional reason OK) — also `n` / `cancel` / `reject`
+
+Platforms with buttons (Telegram, Discord, Slack, …) use Allow Once / Session / Always / Deny controls instead; plain-text fallbacks still list the cues above.
 
 The `HERMES_EXEC_ASK=1` environment variable is automatically set when running the gateway.
 
