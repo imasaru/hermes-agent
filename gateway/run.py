@@ -11289,8 +11289,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("Skill command check failed (non-fatal): %s", e)
         
         # Pending exec approvals are handled by /approve and /deny commands above.
-        # No bare text matching — "yes" in normal conversation must not trigger
-        # execution of a dangerous command.
+        # No bare text matching for *dangerous commands* here — "yes" in normal
+        # conversation must not trigger execution of a dangerous command.
+        #
+        # Kanban review decisions ARE matched as free text when the chat/topic
+        # has a pending human-review block (e.g. Zulip topic ``t_xxx — Title``).
+        # "lgtm, please also fix the tests" → approve with that comment so the
+        # respawned worker receives the guidance in the task thread.
+        try:
+            _kanban_nl = await self.try_handle_kanban_natural_decision(event)
+        except Exception as _knl_exc:
+            logger.debug("kanban natural decision skipped: %s", _knl_exc)
+            _kanban_nl = None
+        if _kanban_nl is not None:
+            return _kanban_nl
 
         if await asyncio.to_thread(self._is_telegram_topic_root_lobby, source):
             # Debounce the lobby reminder so a user who forgets about

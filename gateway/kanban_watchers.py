@@ -139,6 +139,34 @@ def _release_singleton_lock(handle) -> None:
         pass
 
 
+
+def _zulip_approval_topic(task_id: str, title: Optional[str] = None) -> str:
+    """Build a Zulip topic name: ``t_xxx — Title`` capped at 60 chars.
+
+    Zulip's topic limit is 60. Always keep the full task id prefix so bare
+    ``/approve`` in the topic can recover the id even when the title is
+    truncated.
+    """
+    tid = (task_id or "").strip()
+    if not tid:
+        return "hermes-approval"
+    title = (title or "").strip().replace("\n", " ")
+    while "  " in title:
+        title = title.replace("  ", " ")
+    if not title:
+        return tid[:60]
+    sep = " — "
+    budget = 60 - len(tid) - len(sep)
+    if budget < 1:
+        return tid[:60]
+    if len(title) > budget:
+        if budget <= 1:
+            title = title[:budget]
+        else:
+            title = title[: max(1, budget - 1)].rstrip() + "…"
+    return f"{tid}{sep}{title}"
+
+
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
@@ -666,17 +694,20 @@ class GatewayKanbanWatchersMixin:
                                     sub["task_id"], _as_exc,
                                 )
                         metadata: dict[str, Any] = {}
-                        # Zulip: put human-review approval pings in a
-                        # dedicated topic named after the task id so
-                        # bare /approve in that topic has clear context
-                        # and general stays uncluttered.
+                        # Zulip: human-review approval pings go to a
+                        # dedicated topic ``t_xxx — Title`` so context is
+                        # obvious and bare /approve can recover the id.
                         if (
                             platform_str == "zulip"
                             and is_approval_block
                             and kind == "blocked"
                         ):
-                            metadata["thread_id"] = sub["task_id"]
-                            metadata["topic"] = sub["task_id"]
+                            title = ""
+                            if task is not None:
+                                title = task.title or ""
+                            ztopic = _zulip_approval_topic(sub["task_id"], title)
+                            metadata["thread_id"] = ztopic
+                            metadata["topic"] = ztopic
                         elif sub.get("thread_id"):
                             metadata["thread_id"] = sub["thread_id"]
                         sub_key = (
@@ -963,7 +994,13 @@ class GatewayKanbanWatchersMixin:
                                 continue
                         except Exception:
                             continue
-                        sub_thread = tid if pstr == "zulip" else thread
+                        if pstr == "zulip":
+                            t_obj = task  # already loaded
+                            sub_thread = _zulip_approval_topic(
+                                tid, getattr(t_obj, "title", None),
+                            )
+                        else:
+                            sub_thread = thread
                         try:
                             _kb.add_notify_sub(
                                 conn,
