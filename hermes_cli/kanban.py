@@ -55,13 +55,17 @@ def _fmt_task_line(t: kb.Task) -> str:
     assignee = t.assignee or "(unassigned)"
     tenant = f" [{t.tenant}]" if t.tenant else ""
     block = ""
-    if t.block_kind:
+    # Only surface active blocks in list lines. After approve/unblock the
+    # row may still hold block_kind for loop detection — that must not look
+    # like the task is still review-required while status is ready.
+    if t.is_active_block():
         rec = f" x{t.block_recurrences}" if t.block_recurrences else ""
         block = f" [{t.block_kind}{rec}]"
     return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}{block}  {t.title}"
 
 
 def _task_to_dict(t: kb.Task) -> dict[str, Any]:
+    active = t.is_active_block()
     return {
         "id": t.id,
         "title": t.title,
@@ -84,8 +88,11 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
+        # Raw DB fields (may linger after unblock for loop detection).
         "block_kind": t.block_kind,
         "block_recurrences": t.block_recurrences,
+        # Display-oriented: null when kind is residue only (ready after approve).
+        "active_block_kind": t.block_kind if active else None,
     }
 
 
@@ -1569,8 +1576,21 @@ def _cmd_show(args: argparse.Namespace) -> int:
     print(f"Task {task.id}: {task.title}")
     print(f"  status:    {task.status}")
     print(f"  assignee:  {task.assignee or '-'}")
+    # Active wait → block_kind. Ready/running after approve keeps the DB
+    # column for loop detection but labels it last_block_kind so the UI
+    # does not look still-blocked (Option A: display-only fix).
     if task.block_kind:
-        print(f"  block_kind: {task.block_kind} (recurrences: {task.block_recurrences})")
+        if task.is_active_block():
+            print(
+                f"  block_kind: {task.block_kind} "
+                f"(recurrences: {task.block_recurrences})"
+            )
+        else:
+            print(
+                f"  last_block_kind: {task.block_kind} "
+                f"(recurrences: {task.block_recurrences}; "
+                f"loop-detection memory, not currently blocked)"
+            )
     if task.tenant:
         print(f"  tenant:    {task.tenant}")
     print(f"  workspace: {task.workspace_kind}" +

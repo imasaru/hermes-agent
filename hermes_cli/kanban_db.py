@@ -175,6 +175,35 @@ def parse_block_kind(
     return None, r
 
 
+def task_block_kind_is_active(
+    status: Optional[str],
+    block_kind: Optional[str],
+) -> bool:
+    """Return True when ``block_kind`` should be shown as a *current* block.
+
+    ``unblock_task`` / ``approve_task`` deliberately leave ``block_kind`` and
+    ``block_recurrences`` on the row so a same-kind re-block can detect loops
+    and escalate to triage. That residue must not be presented as an active
+    block while the task is ``ready`` / ``running`` / ordinary ``todo``.
+
+    Active when:
+      * status is ``blocked``, ``scheduled``, or ``triage`` (waiting / escalated)
+      * status is ``todo`` and kind is ``dependency`` (parent-gate wait)
+
+    Otherwise the kind is loop-detection memory only — hide it, or label it
+    ``last_block_kind`` in detail views.
+    """
+    if not block_kind:
+        return False
+    st = (status or "").strip().lower()
+    kind = (block_kind or "").strip().lower()
+    if st in ("blocked", "scheduled", "triage"):
+        return True
+    if st == "todo" and kind == "dependency":
+        return True
+    return False
+
+
 def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:
     """Fire a kanban lifecycle plugin hook, fully best-effort.
 
@@ -990,10 +1019,24 @@ class Task:
     # Typed block reason (one of VALID_BLOCK_KINDS) or None for legacy/un-typed
     # blocks. Set by ``block_task``; preserved across unblock so a re-block for
     # the same kind is recognisable as an unblock↔re-block loop.
+    # UI note: the column may still be set while status is ready/running/todo
+    # after approve/unblock (loop-detection memory). Prefer
+    # :meth:`is_active_block` / :func:`task_block_kind_is_active` for display —
+    # do not treat a non-null ``block_kind`` alone as "currently blocked".
     block_kind: Optional[str] = None
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+
+    def is_active_block(self) -> bool:
+        """True when ``block_kind`` describes a *current* wait, not residue.
+
+        After approve/unblock the row keeps ``block_kind`` + ``block_recurrences``
+        so a same-kind re-block can climb toward ``BLOCK_RECURRENCE_LIMIT``.
+        Human-facing UI should only treat the kind as active while the task
+        is actually waiting (blocked/scheduled/triage, or dependency→todo).
+        """
+        return task_block_kind_is_active(self.status, self.block_kind)
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -5364,7 +5407,8 @@ def approve_task(
         return False, "actor is required"
     actor = actor.strip()
     # Validate task exists and check current status (+ capture block_kind
-    # for the audit event before unblock clears it).
+    # for the audit event). Unblock deliberately does NOT clear block_kind
+    # / block_recurrences — they remain as loop-detection memory.
     row = conn.execute(
         "SELECT status, block_kind FROM tasks WHERE id = ?",
         (task_id,),

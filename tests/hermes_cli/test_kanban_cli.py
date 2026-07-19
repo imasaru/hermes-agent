@@ -160,6 +160,47 @@ def test_run_slash_block_unblock_cycle(kanban_home):
     show = kc.run_slash(f"show {tid}")
     assert "block_kind: review-required" in show
     assert "Unblocked" in kc.run_slash(f"unblock {tid}")
+    # Option A: after unblock, ready UI must not look still-blocked.
+    show_ready = kc.run_slash(f"show {tid}")
+    assert "status:    ready" in show_ready or "status: ready" in show_ready
+    assert "  block_kind: review-required" not in show_ready
+    assert "last_block_kind: review-required" in show_ready
+    assert "not currently blocked" in show_ready
+    # List line must not carry [review-required] while ready.
+    listing = kc.run_slash("list")
+    ready_line = next(line for line in listing.splitlines() if tid in line)
+    assert "[review-required" not in ready_line
+    # JSON keeps raw residue + null active_block_kind for display consumers.
+    show_json = json.loads(kc.run_slash(f"show {tid} --json"))
+    task_payload = show_json.get("task") or show_json
+    assert task_payload.get("status") == "ready"
+    assert task_payload.get("block_kind") == "review-required"
+    assert task_payload.get("active_block_kind") is None
+    assert int(task_payload.get("block_recurrences") or 0) >= 1
+
+
+def test_run_slash_approve_ready_ui_not_misleading(kanban_home):
+    """approve_task → ready must not print active block_kind (Option A)."""
+    out = kc.run_slash("create 'approve ux' --assignee alice")
+    import re
+    tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
+    kc.run_slash(f"claim {tid}")
+    kc.run_slash(f"block {tid} 'please review' --kind review-required")
+    with kb.connect() as conn:
+        ok, msg = kb.approve_task(conn, tid, actor="Evan", reason="lgtm option A")
+        assert ok, msg
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        # DB residue intentional for loop detection
+        assert task.block_kind == "review-required"
+        assert task.block_recurrences >= 1
+        assert task.is_active_block() is False
+    show = kc.run_slash(f"show {tid}")
+    assert "  block_kind: review-required" not in show
+    assert "last_block_kind: review-required" in show
+    listing = kc.run_slash("list")
+    ready_line = next(line for line in listing.splitlines() if tid in line)
+    assert "[review-required" not in ready_line
 
 
 def test_run_slash_block_with_prefix_reason_no_kind(kanban_home):

@@ -2,9 +2,21 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from hermes_cli import kanban_db as kb
+
+
+@pytest.fixture
+def kanban_home(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+    return home
 
 
 def test_parse_block_kind_with_prefix():
@@ -72,3 +84,53 @@ def test_parse_block_kind_explicit_kind_with_whitespace_reason():
     k, r = kb.parse_block_kind("  weird: thing ", kind="transient")
     assert k == "transient"
     assert r == "  weird: thing "  # note: no outer strip when kind explicit
+
+
+@pytest.mark.parametrize(
+    "status,kind,expected",
+    [
+        ("blocked", "review-required", True),
+        ("scheduled", "needs_input", True),
+        ("triage", "capability", True),
+        ("todo", "dependency", True),
+        ("todo", "review-required", False),  # residue only
+        ("ready", "review-required", False),
+        ("running", "review-required", False),
+        ("done", "review-required", False),
+        ("blocked", None, False),
+        ("ready", None, False),
+    ],
+)
+def test_task_block_kind_is_active(status, kind, expected):
+    assert kb.task_block_kind_is_active(status, kind) is expected
+
+
+def test_loop_detection_survives_approve_then_reblock(kanban_home):
+    """Option A: approve keeps kind/recurrences; same-kind re-block still climbs."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="loop", assignee="a")
+        kb.claim_task(conn, tid)
+        assert kb.block_task(conn, tid, reason="need eyes", kind="review-required")
+        t1 = kb.get_task(conn, tid)
+        assert t1.status == "blocked"
+        assert t1.block_kind == "review-required"
+        assert t1.block_recurrences == 1
+        assert t1.is_active_block() is True
+
+        ok, _ = kb.approve_task(conn, tid, actor="Evan", reason="ship it")
+        assert ok
+        t2 = kb.get_task(conn, tid)
+        assert t2.status == "ready"
+        assert t2.block_kind == "review-required"
+        assert t2.block_recurrences == 1
+        assert t2.is_active_block() is False
+
+        kb.claim_task(conn, tid)
+        # Second same-kind block should hit BLOCK_RECURRENCE_LIMIT (default 2)
+        # and route to triage.
+        assert kb.block_task(conn, tid, reason="still need eyes", kind="review-required")
+        t3 = kb.get_task(conn, tid)
+        assert t3.block_kind == "review-required"
+        assert t3.block_recurrences >= kb.BLOCK_RECURRENCE_LIMIT
+        assert t3.status == "triage"
+        assert t3.is_active_block() is True
