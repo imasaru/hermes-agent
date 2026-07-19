@@ -167,6 +167,135 @@ def _zulip_approval_topic(task_id: str, title: Optional[str] = None) -> str:
     return f"{tid}{sep}{title}"
 
 
+def _excerpt_task_body_for_approval(body: Optional[str], *, limit: int = 1800) -> str:
+    """Pick the most decision-relevant excerpt from a task body for chat pings.
+
+    Prefers sections humans need to act on (options, how to decide, acceptance,
+    goal) over full dump. Falls back to head of body. Hard-capped at ``limit``.
+    """
+    if not body or not str(body).strip():
+        return ""
+    raw = str(body).strip().replace("\r\n", "\n")
+    # Prefer fenced decision sections by heading keywords
+    import re
+    headings = list(re.finditer(
+        r"(?im)^(#{1,3}\s+|\*\*)?(what is this|goal|context|options?|option [abc]|how to decide|"
+        r"acceptance|work|background|decision|choose|prefer).*$",
+        raw,
+    ))
+    chunks: list[str] = []
+    if headings:
+        # Take from first matching heading through a few following sections
+        start = headings[0].start()
+        excerpt = raw[start:]
+        # Stop at a late "Out of scope" / "Refs" if present after some content
+        m_stop = re.search(
+            r"(?im)^#{1,3}\s+(out of scope|refs|references|related)\b",
+            excerpt[200:] if len(excerpt) > 200 else "",
+        )
+        if m_stop:
+            excerpt = excerpt[: 200 + m_stop.start()].rstrip()
+        chunks.append(excerpt)
+    else:
+        chunks.append(raw)
+
+    text_out = "\n\n".join(chunks).strip()
+    if len(text_out) > limit:
+        cut = text_out[: max(0, limit - 20)].rstrip()
+        # break on paragraph if possible
+        nl = cut.rfind("\n\n")
+        if nl > limit // 2:
+            cut = cut[:nl].rstrip()
+        text_out = cut + "\n\n…(truncated — full body on task)"
+    return text_out
+
+
+def _format_human_review_block_message(
+    *,
+    board_tag: str,
+    tag: str,
+    task_id: str,
+    block_kind: Optional[str],
+    reason: str,
+    task,
+    recent_comments: Optional[list] = None,
+) -> str:
+    """Rich Zulip/Telegram body for needs_input / capability / review-required."""
+    kind_label = block_kind or "human-review"
+    task_title = ""
+    task_workspace = ""
+    task_body = ""
+    if task is not None:
+        task_title = task.title or ""
+        task_workspace = task.workspace_path or ""
+        task_body = getattr(task, "body", None) or ""
+
+    # Reason may already include a long worker handoff — allow more than 160.
+    reason_full = ""
+    if reason:
+        # reason arg includes leading ": " from caller sometimes; normalize
+        r = reason[2:] if reason.startswith(": ") else reason
+        r = r.strip()
+        if len(r) > 900:
+            r = r[:880].rstrip() + "…"
+        reason_full = r
+
+    lines = [
+        f"⏸ {board_tag}{tag}Kanban `{task_id}` blocked ({kind_label})",
+    ]
+    if task_title:
+        lines.append(f"**{task_title}**")
+    if reason_full:
+        lines.append("")
+        lines.append(f"**Why blocked:** {reason_full}")
+
+    body_ex = _excerpt_task_body_for_approval(task_body, limit=1800)
+    if body_ex:
+        lines.append("")
+        lines.append("**Context (from task body):**")
+        lines.append(body_ex)
+
+    # Latest human/worker comments (often hold the real decision prompt)
+    if recent_comments:
+        lines.append("")
+        lines.append("**Recent comments:**")
+        for c in recent_comments[-5:]:
+            author = getattr(c, "author", None) or (c.get("author") if isinstance(c, dict) else "?")
+            body = getattr(c, "body", None) or (c.get("body") if isinstance(c, dict) else "")
+            body = (body or "").strip()
+            if not body:
+                continue
+            if len(body) > 400:
+                body = body[:380].rstrip() + "…"
+            lines.append(f"- **{author}:** {body}")
+
+    if task_workspace:
+        lines.append("")
+        lines.append(f"_Workspace:_ `{task_workspace}`")
+
+    lines.append("")
+    if block_kind == "review-required":
+        lines.append(
+            "Review required — approve promotes to ready and can respawn the worker."
+        )
+    elif block_kind == "needs_input":
+        lines.append(
+            "Needs your input — reply with a decision (or approve/deny)."
+        )
+    lines.append("")
+    lines.append("**Reply in this topic (natural language OK):**")
+    lines.append("- `lgtm! <notes for worker>` or `yes` / `approve`")
+    lines.append("- `deny <reason>` or `no, <reason>`")
+    lines.append("")
+    lines.append("**Commands:**")
+    lines.append(f"- `/kanban approve {task_id}`")
+    lines.append(f'- `/kanban deny {task_id} "reason"`')
+    lines.append(f"- `/kanban show {task_id}`")
+    return "\n".join(lines)
+
+
+
+
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
@@ -562,33 +691,34 @@ class GatewayKanbanWatchersMixin:
                                 "needs_input", "capability", "review-required",
                             }
                             if is_approval_block:
-                                kind_label = block_kind or "human-review"
-                                # Get task title and workspace for richer context
-                                task_title = ""
-                                task_workspace = ""
+                                # Full reason text for the formatter (not the
+                                # ultra-short ": …" used in one-liners).
+                                reason_raw = ""
+                                if ev.payload and ev.payload.get("reason"):
+                                    reason_raw = str(ev.payload["reason"])
+                                recent_comments = []
                                 if task is not None:
-                                    task_title = task.title or ""
-                                    task_workspace = task.workspace_path or ""
-                                # Build the enhanced notification
-                                lines = [
-                                    f"⏸ {board_tag}{tag}Kanban {sub['task_id']} "
-                                    f"blocked ({kind_label}){reason}",
-                                ]
-                                if task_title:
-                                    lines.append(f"\nTask: {task_title}")
-                                if task_workspace:
-                                    lines.append(f"Workspace: {task_workspace}")
-                                # Add review-required specific guidance
-                                if block_kind == "review-required":
-                                    lines.append(
-                                        "\nReview required — approve to promote to ready "
-                                        "and respawn worker."
-                                    )
-                                lines.append("")
-                                lines.append(f"Approve:  /kanban approve {sub['task_id']}")
-                                lines.append(f"Deny:     /kanban deny {sub['task_id']} \"reason\"")
-                                lines.append(f"Details:  /kanban show {sub['task_id']}")
-                                msg = "\n".join(lines)
+                                    try:
+                                        from hermes_cli import kanban_db as _kb_c
+                                        # Delivery phase has no open conn; open briefly.
+                                        _bc = _kb_c.connect(board=board_slug)
+                                        try:
+                                            recent_comments = _kb_c.list_comments(
+                                                _bc, sub["task_id"],
+                                            )
+                                        finally:
+                                            _bc.close()
+                                    except Exception:
+                                        recent_comments = []
+                                msg = _format_human_review_block_message(
+                                    board_tag=board_tag,
+                                    tag=tag,
+                                    task_id=sub["task_id"],
+                                    block_kind=block_kind,
+                                    reason=reason_raw,
+                                    task=task,
+                                    recent_comments=recent_comments,
+                                )
                             else:
                                 msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
                         elif kind == "approved":
