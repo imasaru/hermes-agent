@@ -4596,6 +4596,139 @@ class GatewaySlashCommandsMixin:
         lines.append("Invoke a bundle with `/<slug>` to load all its skills.")
         return "\n".join(lines)
 
+
+    def _find_contextual_kanban_review_tasks(
+        self,
+        *,
+        platform: str,
+        chat_id: str,
+        thread_id: Optional[str] = None,
+        recent_seconds: int = 60,
+    ) -> list[dict]:
+        """Find blocked human-review kanban tasks relevant to this chat.
+
+        Used by bare ``/approve`` / ``/deny`` so the user does not need to
+        paste a task id when:
+
+        - only one review-blocked task is subscribed to this chat, or
+        - several are subscribed but exactly one was blocked within the
+          last ``recent_seconds`` (default 60s) — i.e. they are replying
+          to the just-sent notification.
+
+        Returns a list of dicts ``{task_id, board, block_kind, blocked_at}``
+        sorted newest-first. Empty when nothing matches.
+        """
+        import time
+        from hermes_cli import kanban_db as _kb
+
+        platform = (platform or "").lower()
+        chat_id = str(chat_id or "")
+        thread_norm = (thread_id or "")
+        now = int(time.time())
+        out: list[dict] = []
+
+        try:
+            boards = _kb.list_boards(include_archived=False)
+        except Exception:
+            boards = [{"slug": _kb.DEFAULT_BOARD}]
+
+        for board_meta in boards:
+            slug = board_meta.get("slug") or _kb.DEFAULT_BOARD
+            try:
+                conn = _kb.connect(board=slug)
+            except Exception:
+                continue
+            try:
+                subs = _kb.list_notify_subs(conn)
+                for sub in subs:
+                    if (sub.get("platform") or "").lower() != platform:
+                        continue
+                    if str(sub.get("chat_id") or "") != chat_id:
+                        continue
+                    # Thread match: exact, or sub has no thread (chat-wide),
+                    # or caller has no thread (accept any sub for that chat).
+                    sub_thread = sub.get("thread_id") or ""
+                    if thread_norm and sub_thread and sub_thread != thread_norm:
+                        continue
+                    tid = sub.get("task_id")
+                    if not tid:
+                        continue
+                    task = _kb.get_task(conn, tid)
+                    if task is None or task.status not in ("blocked", "scheduled"):
+                        continue
+                    kind = getattr(task, "block_kind", None)
+                    if kind not in _kb.HUMAN_REVIEW_KINDS and kind is not None:
+                        # Untyped blocks still count as human-review candidates
+                        # when kind is None; typed non-human kinds are skipped.
+                        if kind not in (None, ""):
+                            if kind not in _kb.HUMAN_REVIEW_KINDS:
+                                continue
+                    # When kind is set and not human-review, skip
+                    if kind and kind not in _kb.HUMAN_REVIEW_KINDS:
+                        continue
+                    # Find most recent blocked event time
+                    blocked_at = 0
+                    try:
+                        row = conn.execute(
+                            "SELECT created_at FROM task_events "
+                            "WHERE task_id = ? AND kind = 'blocked' "
+                            "ORDER BY id DESC LIMIT 1",
+                            (tid,),
+                        ).fetchone()
+                        if row is not None:
+                            blocked_at = int(row["created_at"] or 0)
+                    except Exception:
+                        blocked_at = 0
+                    out.append({
+                        "task_id": tid,
+                        "board": slug,
+                        "block_kind": kind,
+                        "blocked_at": blocked_at,
+                        "age_s": (now - blocked_at) if blocked_at else None,
+                    })
+            finally:
+                conn.close()
+
+        # Deduplicate by task_id (keep newest)
+        by_id: dict[str, dict] = {}
+        for item in out:
+            prev = by_id.get(item["task_id"])
+            if prev is None or item["blocked_at"] >= prev["blocked_at"]:
+                by_id[item["task_id"]] = item
+        items = sorted(by_id.values(), key=lambda x: x["blocked_at"], reverse=True)
+
+        if not items:
+            return []
+        if len(items) == 1:
+            return items
+        # Multiple: keep those blocked within recent_seconds
+        recent = [
+            i for i in items
+            if i.get("blocked_at") and (now - i["blocked_at"]) <= recent_seconds
+        ]
+        if len(recent) == 1:
+            return recent
+        if recent:
+            return recent  # caller will ask user to disambiguate
+        return items
+
+    def _format_kanban_review_choices(self, items: list[dict]) -> str:
+        lines = [
+            "Multiple kanban review tasks need a decision. Specify one:",
+            "",
+        ]
+        for i in items[:10]:
+            age = i.get("age_s")
+            age_s = f", {age}s ago" if isinstance(age, int) else ""
+            kind = i.get("block_kind") or "blocked"
+            lines.append(
+                f"  /approve {i['task_id']}   "
+                f"({i.get('board')}, {kind}{age_s})"
+            )
+        lines.append("")
+        lines.append("Or: /kanban show <id>")
+        return "\n".join(lines)
+
     async def _handle_approve_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /approve command — unblock waiting agent thread(s).
 
@@ -4628,23 +4761,84 @@ class GatewaySlashCommandsMixin:
         tokens = raw_args.split()
         lower_tokens = [t.lower() for t in tokens]
 
-        # Contextual kanban task approve: /approve t_xxx [reason...]
-        # Only when no dangerous-command approval is pending (precedence rule).
-        task_id_token = next((t for t in tokens if t.startswith("t_") and len(t) >= 4), None)
-        if task_id_token and not has_blocking_approval(session_key):
-            reason_parts = [t for t in tokens if t != task_id_token]
-            reason = " ".join(reason_parts).strip() or None
-            try:
-                from hermes_cli.kanban import run_slash
-                cmd = f"approve {task_id_token}"
-                if reason:
-                    # Quote reason for shlex in run_slash
-                    cmd += f" --reason {shlex.quote(reason)}"
-                output = await asyncio.to_thread(run_slash, cmd)
-                return output
-            except Exception as exc:
-                logger.warning("kanban contextual /approve failed: %s", exc)
-                return f"Failed to approve {task_id_token}: {exc}"
+        # Contextual kanban task approve — only when no dangerous-command
+        # approval is pending (precedence rule).
+        #   /approve t_xxx [reason]
+        #   /approve            → single pending review in this chat, or the
+        #                         one blocked within the last 60s
+        if not has_blocking_approval(session_key):
+            task_id_token = next(
+                (t for t in tokens if t.startswith("t_") and len(t) >= 4), None
+            )
+            # Ignore dangerous-cmd tokens when looking for bare approve
+            bare_tokens = {
+                "all", "session", "ses", "always", "permanent", "permanently", "once",
+            }
+            is_bare = (not tokens) or all(t.lower() in bare_tokens for t in tokens)
+            # Bare approve should NOT steal "all/session/always" when those are
+            # meant for dangerous commands — only when no dangerous pending
+            # (already gated) and not exclusively those tokens with no kanban.
+            reason = None
+            if task_id_token:
+                reason_parts = [t for t in tokens if t != task_id_token]
+                reason = " ".join(reason_parts).strip() or None
+            elif is_bare or not any(t.startswith("t_") for t in tokens):
+                # Try chat-context resolution for bare /approve
+                try:
+                    platform = getattr(source, "platform", None)
+                    platform_str = (
+                        platform.value if hasattr(platform, "value") else str(platform or "")
+                    ).lower()
+                    items = await asyncio.to_thread(
+                        self._find_contextual_kanban_review_tasks,
+                        platform=platform_str,
+                        chat_id=str(getattr(source, "chat_id", "") or ""),
+                        thread_id=getattr(source, "thread_id", None),
+                    )
+                except Exception as exc:
+                    logger.warning("contextual kanban lookup failed: %s", exc)
+                    items = []
+                if len(items) == 1:
+                    task_id_token = items[0]["task_id"]
+                    # Prefer board-scoped approve via --board if needed later
+                    reason = " ".join(
+                        t for t in tokens if t.lower() not in bare_tokens
+                    ).strip() or None
+                elif len(items) > 1:
+                    return self._format_kanban_review_choices(items)
+            if task_id_token:
+                try:
+                    from hermes_cli.kanban import run_slash
+                    # Board-aware: pass --board when we know it
+                    board = None
+                    try:
+                        # Reuse lookup for board tag
+                        platform = getattr(source, "platform", None)
+                        platform_str = (
+                            platform.value if hasattr(platform, "value") else str(platform or "")
+                        ).lower()
+                        found = await asyncio.to_thread(
+                            self._find_contextual_kanban_review_tasks,
+                            platform=platform_str,
+                            chat_id=str(getattr(source, "chat_id", "") or ""),
+                            thread_id=getattr(source, "thread_id", None),
+                        )
+                        for it in found:
+                            if it["task_id"] == task_id_token:
+                                board = it.get("board")
+                                break
+                    except Exception:
+                        board = None
+                    cmd = f"approve {task_id_token}"
+                    if board:
+                        cmd = f"--board {board} approve {task_id_token}"
+                    if reason:
+                        cmd += f" --reason {shlex.quote(reason)}"
+                    output = await asyncio.to_thread(run_slash, cmd)
+                    return output
+                except Exception as exc:
+                    logger.warning("kanban contextual /approve failed: %s", exc)
+                    return f"Failed to approve {task_id_token}: {exc}"
 
         # Parse args early so we can use choice for both regular and kanban permission approvals (t_bb012ceb)
         resolve_all = "all" in lower_tokens
@@ -4711,21 +4905,72 @@ class GatewaySlashCommandsMixin:
         raw_args = event.get_command_args().strip()
         tokens = raw_args.split()
 
-        # Contextual kanban task deny: /deny t_xxx [reason...]
-        task_id_token = next((t for t in tokens if t.startswith("t_") and len(t) >= 4), None)
-        if task_id_token and not has_blocking_approval(session_key):
-            reason_parts = [t for t in tokens if t != task_id_token]
-            reason = " ".join(reason_parts).strip() or None
-            try:
-                from hermes_cli.kanban import run_slash
-                cmd = f"deny {task_id_token}"
-                if reason:
-                    cmd += f" --reason {shlex.quote(reason)}"
-                output = await asyncio.to_thread(run_slash, cmd)
-                return output
-            except Exception as exc:
-                logger.warning("kanban contextual /deny failed: %s", exc)
-                return f"Failed to deny {task_id_token}: {exc}"
+        # Contextual kanban task deny — same resolution rules as /approve.
+        if not has_blocking_approval(session_key):
+            task_id_token = next(
+                (t for t in tokens if t.startswith("t_") and len(t) >= 4), None
+            )
+            reason = None
+            if task_id_token:
+                reason_parts = [t for t in tokens if t != task_id_token]
+                reason = " ".join(reason_parts).strip() or None
+            else:
+                try:
+                    platform = getattr(source, "platform", None)
+                    platform_str = (
+                        platform.value if hasattr(platform, "value") else str(platform or "")
+                    ).lower()
+                    items = await asyncio.to_thread(
+                        self._find_contextual_kanban_review_tasks,
+                        platform=platform_str,
+                        chat_id=str(getattr(source, "chat_id", "") or ""),
+                        thread_id=getattr(source, "thread_id", None),
+                    )
+                except Exception as exc:
+                    logger.warning("contextual kanban lookup failed: %s", exc)
+                    items = []
+                if len(items) == 1:
+                    task_id_token = items[0]["task_id"]
+                    reason = " ".join(tokens).strip() or None
+                elif len(items) > 1 and not tokens:
+                    # bare /deny with ambiguity
+                    choices = self._format_kanban_review_choices(items)
+                    return choices.replace("/approve", "/deny")
+                elif len(items) > 1:
+                    # reason-only args without task id + multiple tasks
+                    choices = self._format_kanban_review_choices(items)
+                    return choices.replace("/approve", "/deny")
+            if task_id_token:
+                try:
+                    from hermes_cli.kanban import run_slash
+                    board = None
+                    try:
+                        platform = getattr(source, "platform", None)
+                        platform_str = (
+                            platform.value if hasattr(platform, "value") else str(platform or "")
+                        ).lower()
+                        found = await asyncio.to_thread(
+                            self._find_contextual_kanban_review_tasks,
+                            platform=platform_str,
+                            chat_id=str(getattr(source, "chat_id", "") or ""),
+                            thread_id=getattr(source, "thread_id", None),
+                        )
+                        for it in found:
+                            if it["task_id"] == task_id_token:
+                                board = it.get("board")
+                                break
+                    except Exception:
+                        board = None
+                    cmd = f"deny {task_id_token}"
+                    if board:
+                        cmd = f"--board {board} deny {task_id_token}"
+                    if reason:
+                        cmd += f" --reason {shlex.quote(reason)}"
+                    output = await asyncio.to_thread(run_slash, cmd)
+                    return output
+                except Exception as exc:
+                    logger.warning("kanban contextual /deny failed: %s", exc)
+                    return f"Failed to deny {task_id_token}: {exc}"
 
         if not has_blocking_approval(session_key):
             if session_key in self._pending_approvals:

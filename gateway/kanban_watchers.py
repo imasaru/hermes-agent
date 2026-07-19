@@ -394,6 +394,22 @@ class GatewayKanbanWatchersMixin:
                             conn.close()
                     return deliveries
 
+                # Home-channel auto-subscribe FIRST (before claim) so
+                # unsubscribed human-review blocks get a sub and are
+                # included in this tick's claim/delivery pass. Zulip
+                # subs use thread_id=task_id (dedicated topic).
+                if auto_subscribe_enabled:
+                    try:
+                        await asyncio.to_thread(
+                            self._kanban_home_auto_sub_unsubscribed_blocks,
+                            auto_subscribe_enabled,
+                        )
+                    except Exception as _hs_exc:
+                        logger.warning(
+                            "kanban notifier: home auto-sub pass failed: %s",
+                            _hs_exc,
+                        )
+
                 deliveries = await asyncio.to_thread(_collect)
                 for d in deliveries:
                     sub = d["sub"]
@@ -650,7 +666,18 @@ class GatewayKanbanWatchersMixin:
                                     sub["task_id"], _as_exc,
                                 )
                         metadata: dict[str, Any] = {}
-                        if sub.get("thread_id"):
+                        # Zulip: put human-review approval pings in a
+                        # dedicated topic named after the task id so
+                        # bare /approve in that topic has clear context
+                        # and general stays uncluttered.
+                        if (
+                            platform_str == "zulip"
+                            and is_approval_block
+                            and kind == "blocked"
+                        ):
+                            metadata["thread_id"] = sub["task_id"]
+                            metadata["topic"] = sub["task_id"]
+                        elif sub.get("thread_id"):
                             metadata["thread_id"] = sub["thread_id"]
                         sub_key = (
                             sub["task_id"], sub["platform"],
@@ -828,7 +855,141 @@ class GatewayKanbanWatchersMixin:
                     return
                 await asyncio.sleep(1)
 
+
+    def _kanban_home_auto_sub_unsubscribed_blocks(
+        self, auto_subscribe_cfg: bool,
+    ) -> int:
+        """Subscribe home channels to human-review blocks with no subscribers.
+
+        For Zulip, uses ``thread_id = task_id`` so the notification opens a
+        dedicated topic named after the ticket. Returns number of new subs.
+        """
+        if not auto_subscribe_cfg:
+            return 0
+        from hermes_cli import kanban_db as _kb
+        from gateway.config import Platform as _Platform
+        import time
+
+        # Resolve home channels from connected adapters / config
+        homes: list[tuple[str, str, str]] = []  # platform, chat_id, default_thread
+        try:
+            cfg = getattr(self, "config", None)
+            platforms = getattr(cfg, "platforms", None) or {}
+            for plat, pcfg in platforms.items():
+                pstr = plat.value if hasattr(plat, "value") else str(plat)
+                pstr = pstr.lower()
+                hc = getattr(pcfg, "home_channel", None) if pcfg else None
+                if hc is None and isinstance(pcfg, dict):
+                    hc = pcfg.get("home_channel")
+                chat_id = None
+                thread = ""
+                if hc is not None:
+                    chat_id = getattr(hc, "chat_id", None) or (
+                        hc.get("chat_id") if isinstance(hc, dict) else None
+                    )
+                    # Zulip topic default is empty here — we override per task
+                    thread = getattr(hc, "thread_id", None) or (
+                        hc.get("thread_id") if isinstance(hc, dict) else None
+                    ) or ""
+                if not chat_id:
+                    # env fallbacks commonly used by plugins
+                    import os
+                    if pstr == "zulip":
+                        chat_id = os.environ.get("ZULIP_HOME_CHANNEL") or ""
+                    elif pstr == "telegram":
+                        chat_id = os.environ.get("TELEGRAM_HOME_CHANNEL") or ""
+                if chat_id:
+                    homes.append((pstr, str(chat_id), str(thread or "")))
+        except Exception as exc:
+            logger.debug("kanban notifier: home channel resolve failed: %s", exc)
+            return 0
+
+        if not homes:
+            return 0
+
+        now = int(time.time())
+        # Only consider blocks from the last hour to avoid flooding old cards
+        window = now - 3600
+        created = 0
+        try:
+            boards = _kb.list_boards(include_archived=False)
+        except Exception:
+            boards = [{"slug": _kb.DEFAULT_BOARD}]
+
+        for board_meta in boards:
+            slug = board_meta.get("slug") or _kb.DEFAULT_BOARD
+            try:
+                conn = _kb.connect(board=slug)
+            except Exception:
+                continue
+            try:
+                # Recent blocked events
+                rows = conn.execute(
+                    "SELECT e.task_id, e.payload, e.created_at FROM task_events e "
+                    "WHERE e.kind = 'blocked' AND e.created_at >= ? "
+                    "ORDER BY e.id DESC LIMIT 50",
+                    (window,),
+                ).fetchall()
+                seen_tasks: set[str] = set()
+                for r in rows:
+                    tid = r["task_id"]
+                    if tid in seen_tasks:
+                        continue
+                    seen_tasks.add(tid)
+                    task = _kb.get_task(conn, tid)
+                    if task is None or task.status != "blocked":
+                        continue
+                    kind = getattr(task, "block_kind", None)
+                    if kind and kind not in _kb.HUMAN_REVIEW_KINDS:
+                        continue
+                    # payload kind fallback
+                    if not kind:
+                        try:
+                            import json as _json
+                            pl = _json.loads(r["payload"]) if r["payload"] else {}
+                            kind = (pl or {}).get("kind")
+                        except Exception:
+                            kind = None
+                        if kind and kind not in _kb.HUMAN_REVIEW_KINDS:
+                            continue
+                    existing = _kb.list_notify_subs(conn, task_id=tid)
+                    if existing:
+                        continue
+                    for pstr, chat_id, thread in homes:
+                        # Skip if adapter not connected
+                        try:
+                            plat = _Platform(pstr)
+                            if not self.adapters.get(plat):
+                                continue
+                        except Exception:
+                            continue
+                        sub_thread = tid if pstr == "zulip" else thread
+                        try:
+                            _kb.add_notify_sub(
+                                conn,
+                                task_id=tid,
+                                platform=pstr,
+                                chat_id=chat_id,
+                                thread_id=sub_thread or "",
+                                notifier_profile=self._active_profile_name(),
+                            )
+                            created += 1
+                            logger.info(
+                                "kanban notifier: home auto-sub %s/%s topic=%s "
+                                "task %s board %s",
+                                pstr, chat_id, sub_thread or "-", tid, slug,
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "kanban notifier: home auto-sub failed for %s: %s",
+                                tid, exc,
+                            )
+            finally:
+                conn.close()
+        return created
+
     def _kanban_advance(
+
         self, sub: dict, cursor: int, board: Optional[str] = None,
     ) -> None:
         """Sync helper: advance a subscription's cursor. Runs in to_thread.

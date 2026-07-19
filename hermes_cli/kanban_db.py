@@ -2391,23 +2391,34 @@ def write_txn(conn: sqlite3.Connection):
     task + recording an event, etc.).  A claim CAS inside this context is
     atomic -- at most one concurrent writer can succeed.
 
+    Nested calls join the outer transaction (no second BEGIN IMMEDIATE).
+    Only the outermost context COMMITs or ROLLBACKs. This lets helpers
+    like ``add_comment`` / ``unblock_task`` be composed inside
+    ``approve_task`` without ``cannot start a transaction within a
+    transaction``.
+
     The explicit ROLLBACK on exception is wrapped in try/except so that
     a SQLite auto-rollback (which leaves no active transaction) does not
     shadow the original exception with a spurious rollback error.
     """
-    _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
+    nested = bool(getattr(conn, "in_transaction", False))
+    if not nested:
+        _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
     try:
         yield conn
     except Exception:
-        try:
-            conn.execute("ROLLBACK")
-        except sqlite3.OperationalError:
-            # SQLite has already auto-rolled-back the transaction (typical
-            # under EIO, lock contention, or corruption). Nothing to undo;
-            # do not let this secondary failure shadow the real one.
-            pass
+        if not nested:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                # SQLite has already auto-rolled-back the transaction (typical
+                # under EIO, lock contention, or corruption). Nothing to undo;
+                # do not let this secondary failure shadow the real one.
+                pass
         raise
     else:
+        if nested:
+            return
         try:
             _execute_boundary_with_retry(conn, "COMMIT")
         except Exception:
