@@ -4607,8 +4607,10 @@ class GatewaySlashCommandsMixin:
         Examples that match::
 
             yes
+            lgtm!
             approve
             lgtm — please also update the README
+            lgtm! prefer option b
             approve: looks good, fix nits first
             deny needs tests
             no, please rethink the API
@@ -4618,8 +4620,12 @@ class GatewaySlashCommandsMixin:
         raw = (text or "").strip()
         if not raw or raw.startswith("/"):
             return None
-        # Normalize smart dashes
-        norm = raw.replace("—", "-").replace("–", "-")
+        # Normalize smart dashes / ellipsis
+        norm = (
+            raw.replace("—", "-")
+            .replace("–", "-")
+            .replace("…", "...")
+        )
         lower = norm.lower()
 
         approve_heads = (
@@ -4631,19 +4637,30 @@ class GatewaySlashCommandsMixin:
         )
 
         def _split_head(head: str) -> Optional[str]:
-            if lower == head:
-                return ""
-            if lower.startswith(head + " "):
-                return norm[len(head):].strip(" \t:-")
-            if lower.startswith(head + ":"):
-                return norm[len(head) + 1:].strip()
-            if lower.startswith(head + "-"):
-                return norm[len(head) + 1:].strip()
-            if lower.startswith(head + ","):
-                return norm[len(head) + 1:].strip()
-            return None
+            """Match head at start, allowing trailing punctuation before comment.
 
-        # Prefer longer heads first
+            ``lgtm!``, ``lgtm.``, ``yes...``, ``approve - note`` all count.
+            """
+            # Word-boundary style: head, optional bang/punct, optional sep, rest
+            # Escape head for regex; allow spaces inside multi-word heads.
+            he = re.escape(head)
+            # (?!\w) so "yes" does not match "yesterday"
+            m = re.match(
+                rf"^{he}(?!\w)(?:[!?.,…]+)?(?:\s*[:\-–—,]+\s*|\s+)?(.*)$",
+                lower,
+                flags=re.DOTALL,
+            )
+            if not m:
+                return None
+            # Slice comment from original-cased norm using matched span of rest
+            rest_lower = m.group(1) or ""
+            if not rest_lower:
+                return ""
+            # Align to end of string
+            rest = norm[-len(rest_lower):].strip(" \t:-") if rest_lower else ""
+            return rest
+
+        # Prefer longer heads first so "looks good" wins over "looks"
         for head in sorted(approve_heads, key=len, reverse=True):
             rest = _split_head(head)
             if rest is not None:
@@ -4738,6 +4755,33 @@ class GatewaySlashCommandsMixin:
         if not task_id:
             return None
 
+        # Resolve board if still unknown (topic had id but finder missed
+        # due to thread mismatch). Prefer the board that actually owns it.
+        if board is None:
+            try:
+                def _find_board(tid: str) -> Optional[str]:
+                    from hermes_cli import kanban_db as _kb
+                    try:
+                        boards = _kb.list_boards(include_archived=False)
+                    except Exception:
+                        boards = [{"slug": _kb.DEFAULT_BOARD}]
+                    for b in boards:
+                        slug = b.get("slug") or _kb.DEFAULT_BOARD
+                        try:
+                            c = _kb.connect(board=slug)
+                        except Exception:
+                            continue
+                        try:
+                            t = _kb.get_task(c, tid)
+                            if t is not None:
+                                return slug
+                        finally:
+                            c.close()
+                    return None
+                board = await asyncio.to_thread(_find_board, task_id)
+            except Exception as exc:
+                logger.debug("kanban natural board resolve failed: %s", exc)
+
         try:
             from hermes_cli.kanban import run_slash
             cmd = f"{verb} {task_id}"
@@ -4747,8 +4791,8 @@ class GatewaySlashCommandsMixin:
                 cmd += f" --reason {shlex.quote(comment)}"
             output = await asyncio.to_thread(run_slash, cmd)
             logger.info(
-                "Kanban natural %s for %s (comment=%r) via %s/%s",
-                verb, task_id, (comment or "")[:80], platform_str, chat_id,
+                "Kanban natural %s for %s board=%s (comment=%r) via %s/%s thread=%r",
+                verb, task_id, board, (comment or "")[:80], platform_str, chat_id, thread,
             )
             return output
         except Exception as exc:
