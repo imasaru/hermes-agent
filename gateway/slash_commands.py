@@ -4597,6 +4597,164 @@ class GatewaySlashCommandsMixin:
         return "\n".join(lines)
 
 
+
+    def _parse_kanban_natural_decision(self, text: str) -> Optional[tuple[str, Optional[str]]]:
+        """Parse free-text approve/deny intent with optional trailing comment.
+
+        Returns ``(verb, comment)`` where verb is ``"approve"`` or ``"deny"``,
+        or ``None`` if the message is ordinary conversation.
+
+        Examples that match::
+
+            yes
+            approve
+            lgtm — please also update the README
+            approve: looks good, fix nits first
+            deny needs tests
+            no, please rethink the API
+
+        Bare conversational messages without an approve/deny cue return None.
+        """
+        raw = (text or "").strip()
+        if not raw or raw.startswith("/"):
+            return None
+        # Normalize smart dashes
+        norm = raw.replace("—", "-").replace("–", "-")
+        lower = norm.lower()
+
+        approve_heads = (
+            "approve", "lgtm", "ship it", "shipit", "looks good", "looks great",
+            "yes", "yep", "yeah", "y", "ok", "okay", "confirm", "👍", "✅",
+        )
+        deny_heads = (
+            "deny", "reject", "no", "nope", "n", "nah", "cancel", "👎", "❌",
+        )
+
+        def _split_head(head: str) -> Optional[str]:
+            if lower == head:
+                return ""
+            if lower.startswith(head + " "):
+                return norm[len(head):].strip(" \t:-")
+            if lower.startswith(head + ":"):
+                return norm[len(head) + 1:].strip()
+            if lower.startswith(head + "-"):
+                return norm[len(head) + 1:].strip()
+            if lower.startswith(head + ","):
+                return norm[len(head) + 1:].strip()
+            return None
+
+        # Prefer longer heads first
+        for head in sorted(approve_heads, key=len, reverse=True):
+            rest = _split_head(head)
+            if rest is not None:
+                return ("approve", rest or None)
+        for head in sorted(deny_heads, key=len, reverse=True):
+            rest = _split_head(head)
+            if rest is not None:
+                return ("deny", rest or None)
+        return None
+
+    async def try_handle_kanban_natural_decision(
+        self, event: MessageEvent,
+    ) -> Optional[str]:
+        """Handle bare-word approve/deny (+ optional comment) for kanban reviews.
+
+        Used when the user is replying in a Zulip task topic (or a chat with
+        a single pending review) without typing ``/approve``. Extra text after
+        the cue becomes the approval/denial reason so the respawned worker
+        sees it in the comment thread.
+        """
+        from tools.approval import has_blocking_approval
+
+        source = event.source
+        session_key = self._session_key_for_source(source)
+        # Never steal free text when a dangerous-command approval is live —
+        # that path has its own plain-text handler.
+        if has_blocking_approval(session_key):
+            return None
+
+        parsed = self._parse_kanban_natural_decision(event.text or "")
+        if not parsed:
+            return None
+        verb, comment = parsed
+
+        # Resolve task id: topic prefix, else contextual finder
+        task_id = None
+        board = None
+        thread = (
+            getattr(source, "thread_id", None)
+            or getattr(source, "chat_topic", None)
+            or ""
+        )
+        m = re.match(r"(t_[a-f0-9]{6,})", str(thread).strip())
+        if m:
+            task_id = m.group(1)
+
+        platform = getattr(source, "platform", None)
+        platform_str = (
+            platform.value if hasattr(platform, "value") else str(platform or "")
+        ).lower()
+        chat_id = str(getattr(source, "chat_id", "") or "")
+
+        try:
+            items = await asyncio.to_thread(
+                self._find_contextual_kanban_review_tasks,
+                platform=platform_str,
+                chat_id=chat_id,
+                thread_id=getattr(source, "thread_id", None),
+            )
+        except Exception as exc:
+            logger.warning("kanban natural decision lookup failed: %s", exc)
+            items = []
+
+        if task_id:
+            for it in items:
+                if it["task_id"] == task_id:
+                    board = it.get("board")
+                    break
+            # If topic had id but task not blocked anymore, don't force
+            if not any(it["task_id"] == task_id for it in items) and items:
+                # topic id stale; fall through to contextual if unique
+                if len(items) == 1:
+                    task_id = items[0]["task_id"]
+                    board = items[0].get("board")
+                elif not items:
+                    pass
+            elif not any(it["task_id"] == task_id for it in items) and not items:
+                # Try approve anyway by id across boards via run_slash
+                pass
+        else:
+            if len(items) == 1:
+                task_id = items[0]["task_id"]
+                board = items[0].get("board")
+            elif len(items) > 1:
+                msg = self._format_kanban_review_choices(items)
+                if verb == "deny":
+                    msg = msg.replace("/approve", "/deny")
+                return msg
+            else:
+                return None  # no pending review — normal conversation
+
+        if not task_id:
+            return None
+
+        try:
+            from hermes_cli.kanban import run_slash
+            cmd = f"{verb} {task_id}"
+            if board:
+                cmd = f"--board {board} {verb} {task_id}"
+            if comment:
+                cmd += f" --reason {shlex.quote(comment)}"
+            output = await asyncio.to_thread(run_slash, cmd)
+            logger.info(
+                "Kanban natural %s for %s (comment=%r) via %s/%s",
+                verb, task_id, (comment or "")[:80], platform_str, chat_id,
+            )
+            return output
+        except Exception as exc:
+            logger.warning("kanban natural %s failed: %s", verb, exc)
+            return f"Failed to {verb} {task_id}: {exc}"
+
     def _find_contextual_kanban_review_tasks(
         self,
         *,
@@ -4648,9 +4806,18 @@ class GatewaySlashCommandsMixin:
                     # Thread match: exact, or sub has no thread (chat-wide),
                     # or caller has no thread (accept any sub for that chat).
                     sub_thread = sub.get("thread_id") or ""
-                    if thread_norm and sub_thread and sub_thread != thread_norm:
-                        continue
                     tid = sub.get("task_id")
+                    if thread_norm and sub_thread and sub_thread != thread_norm:
+                        # Zulip topics look like ``t_xxx — Title``. Match if
+                        # either side shares the task-id prefix.
+                        tid_s = str(tid or "")
+                        if not (
+                            thread_norm.startswith(sub_thread)
+                            or sub_thread.startswith(thread_norm)
+                            or (tid_s and thread_norm.startswith(tid_s))
+                            or (tid_s and sub_thread.startswith(tid_s))
+                        ):
+                            continue
                     if not tid:
                         continue
                     task = _kb.get_task(conn, tid)
@@ -4783,29 +4950,41 @@ class GatewaySlashCommandsMixin:
                 reason_parts = [t for t in tokens if t != task_id_token]
                 reason = " ".join(reason_parts).strip() or None
             elif is_bare or not any(t.startswith("t_") for t in tokens):
-                # Try chat-context resolution for bare /approve
-                try:
-                    platform = getattr(source, "platform", None)
-                    platform_str = (
-                        platform.value if hasattr(platform, "value") else str(platform or "")
-                    ).lower()
-                    items = await asyncio.to_thread(
-                        self._find_contextual_kanban_review_tasks,
-                        platform=platform_str,
-                        chat_id=str(getattr(source, "chat_id", "") or ""),
-                        thread_id=getattr(source, "thread_id", None),
-                    )
-                except Exception as exc:
-                    logger.warning("contextual kanban lookup failed: %s", exc)
-                    items = []
-                if len(items) == 1:
-                    task_id_token = items[0]["task_id"]
-                    # Prefer board-scoped approve via --board if needed later
+                # Prefer task id embedded in Zulip topic ``t_xxx — Title``
+                thread = (
+                    getattr(source, "thread_id", None)
+                    or getattr(source, "chat_topic", None)
+                    or ""
+                )
+                m = re.match(r"(t_[a-f0-9]{6,})", str(thread).strip())
+                if m:
+                    task_id_token = m.group(1)
                     reason = " ".join(
                         t for t in tokens if t.lower() not in bare_tokens
                     ).strip() or None
-                elif len(items) > 1:
-                    return self._format_kanban_review_choices(items)
+                else:
+                    # Fall back to chat-context resolution for bare /approve
+                    try:
+                        platform = getattr(source, "platform", None)
+                        platform_str = (
+                            platform.value if hasattr(platform, "value") else str(platform or "")
+                        ).lower()
+                        items = await asyncio.to_thread(
+                            self._find_contextual_kanban_review_tasks,
+                            platform=platform_str,
+                            chat_id=str(getattr(source, "chat_id", "") or ""),
+                            thread_id=getattr(source, "thread_id", None),
+                        )
+                    except Exception as exc:
+                        logger.warning("contextual kanban lookup failed: %s", exc)
+                        items = []
+                    if len(items) == 1:
+                        task_id_token = items[0]["task_id"]
+                        reason = " ".join(
+                            t for t in tokens if t.lower() not in bare_tokens
+                        ).strip() or None
+                    elif len(items) > 1:
+                        return self._format_kanban_review_choices(items)
             if task_id_token:
                 try:
                     from hermes_cli.kanban import run_slash
