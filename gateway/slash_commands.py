@@ -3762,18 +3762,50 @@ class GatewaySlashCommandsMixin:
                     # Zulip stream topics use the topic string as Hermes
                     # thread_id — keep the visible topic aligned with /title
                     # and rekey session routing on success (adapter.rename_topic).
-                    schedule_zulip = getattr(
-                        self, "_schedule_zulip_topic_title_rename", None
+                    # Await (don't fire-and-forget) so /title can surface
+                    # permission failures instead of looking fully successful.
+                    rename_zulip = getattr(
+                        self, "_rename_zulip_topic_for_session_title", None
                     )
-                    if callable(schedule_zulip):
+                    zulip_rename_note = ""
+                    if callable(rename_zulip):
                         try:
-                            await asyncio.to_thread(schedule_zulip, source, session_id, sanitized)
-                        except Exception:
+                            status, detail = await rename_zulip(
+                                source, session_id, sanitized
+                            )
+                            if status == "failed":
+                                zulip_rename_note = t(
+                                    "gateway.title.zulip_topic_rename_failed",
+                                    detail=detail or "unknown error",
+                                )
+                        except Exception as exc:
                             logger.debug(
                                 "Failed to rename Zulip topic from /title",
                                 exc_info=True,
                             )
-                    return t("gateway.title.set_to", title=sanitized)
+                            zulip_rename_note = t(
+                                "gateway.title.zulip_topic_rename_failed",
+                                detail=str(exc) or "unknown error",
+                            )
+                    else:
+                        # Older runners / non-gateway callers: keep schedule path.
+                        schedule_zulip = getattr(
+                            self, "_schedule_zulip_topic_title_rename", None
+                        )
+                        if callable(schedule_zulip):
+                            try:
+                                await asyncio.to_thread(
+                                    schedule_zulip, source, session_id, sanitized
+                                )
+                            except Exception:
+                                logger.debug(
+                                    "Failed to rename Zulip topic from /title",
+                                    exc_info=True,
+                                )
+                    msg = t("gateway.title.set_to", title=sanitized)
+                    if zulip_rename_note:
+                        msg = f"{msg}\n{zulip_rename_note}"
+                    return msg
                 else:
                     return t("gateway.title.not_found")
             except ValueError as e:

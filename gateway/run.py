@@ -15314,65 +15314,90 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     exc_info=True,
                 )
 
+    @staticmethod
+    def _coerce_rename_topic_result(raw) -> tuple[bool, str]:
+        """Normalize adapter.rename_topic return values to ``(ok, detail)``.
+
+        Accepts legacy bare bools and newer ``(ok, detail)`` tuples.
+        """
+        if isinstance(raw, tuple):
+            ok = bool(raw[0]) if raw else False
+            detail = ""
+            if len(raw) > 1 and raw[1] is not None:
+                detail = str(raw[1]).strip()
+            if ok:
+                return True, detail
+            return False, detail or "Zulip topic rename failed"
+        if raw:
+            return True, ""
+        return False, "Zulip topic rename failed"
+
     async def _rename_zulip_topic_for_session_title(
         self,
         source: SessionSource,
         session_id: str,
         title: str,
-    ) -> None:
+    ) -> tuple[str, str]:
         """Best-effort rename of a Zulip stream topic when a session is titled.
 
         On success, rekeys the Hermes session store so the next inbound message
         (which carries the new topic as ``thread_id``) stays on the same
-        session. Failures are logged only — never user-facing.
+        session.
+
+        Returns ``(status, detail)``:
+        - ``(\"ok\", \"\")`` — topic renamed (and rekey attempted)
+        - ``(\"noop\", reason)`` — not a Zulip topic lane / unchanged / missing bits
+        - ``(\"failed\", reason)`` — adapter or rekey failure (logged + caller may surface)
         """
         if not self._is_zulip_topic_lane(source) or not source.chat_id or not source.thread_id:
-            return
+            return "noop", "not a Zulip stream topic session"
         old_topic = str(source.thread_id)
         new_topic = self._sanitize_zulip_topic_title(title, old_topic=old_topic)
         if not new_topic or new_topic == old_topic:
-            return
+            return "noop", "topic unchanged"
 
         adapter = self._adapter_for_source(source)
         if adapter is None:
-            return
+            return "failed", "Zulip adapter unavailable"
         rename_topic = getattr(adapter, "rename_topic", None)
         if rename_topic is None:
-            return
+            return "failed", "Zulip adapter has no rename_topic"
 
         try:
-            ok = await rename_topic(
+            raw = await rename_topic(
                 chat_id=str(source.chat_id),
                 old_topic=old_topic,
                 new_topic=new_topic,
             )
-        except Exception:
+        except Exception as exc:
             logger.debug(
                 "Failed to rename Zulip topic for session title",
                 exc_info=True,
             )
-            return
+            return "failed", str(exc) or "Zulip topic rename error"
+        ok, detail = self._coerce_rename_topic_result(raw)
         if not ok:
-            return
+            return "failed", detail
 
         old_key = self._session_key_for_source(source)
         store = getattr(self, "session_store", None)
         if store is None or not old_key:
-            return
+            # Rename already happened on Zulip; session continuity may break.
+            return "failed", "session store unavailable after Zulip rename"
         try:
             result = await asyncio.to_thread(
                 store.rekey_session_for_new_thread,
                 old_key,
                 new_topic,
             )
-        except Exception:
+        except Exception as exc:
             logger.debug(
                 "Failed to rekey session after Zulip topic rename",
                 exc_info=True,
             )
-            return
+            return "failed", str(exc) or "session rekey failed after Zulip rename"
         if not result:
-            return
+            return "failed", "session rekey refused after Zulip rename (key collision?)"
         _entry, new_key = result
         try:
             self._rekey_runtime_session_maps(old_key, new_key)
@@ -15388,6 +15413,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 source.chat_topic = new_topic
         except Exception:
             pass
+        return "ok", ""
 
     def _schedule_zulip_topic_title_rename(
         self,
