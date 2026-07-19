@@ -162,6 +162,26 @@ def test_run_slash_block_unblock_cycle(kanban_home):
     assert "Unblocked" in kc.run_slash(f"unblock {tid}")
 
 
+def test_run_slash_block_with_prefix_reason_no_kind(kanban_home):
+    """Block using prefix in reason (no --kind flag) auto-sets block_kind and strips prefix (per parse_block_kind)."""
+    out = kc.run_slash("create 'x' --assignee alice")
+    import re
+    tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
+    # Claim first so block() finds it running
+    kc.run_slash(f"claim {tid}")
+    # Prefix in reason, no --kind
+    block_out = kc.run_slash(f"block {tid} 'review-required: auto prefix works'")
+    assert "Blocked" in block_out or "review-required" in block_out.lower()
+    show = kc.run_slash(f"show {tid}")
+    assert "block_kind: review-required" in show
+    # Also via --json (block_kind lives on the nested task object)
+    show_json = kc.run_slash(f"show {tid} --json")
+    payload = json.loads(show_json)
+    task_payload = payload.get("task") or payload
+    assert task_payload.get("block_kind") == "review-required"
+    assert "Unblocked" in kc.run_slash(f"unblock {tid}")
+
+
 def test_run_slash_json_output(kanban_home):
     out = kc.run_slash("create 'jsontask' --assignee alice --json")
     payload = json.loads(out)

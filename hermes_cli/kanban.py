@@ -587,10 +587,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--kind", default=None, choices=sorted(kb.VALID_BLOCK_KINDS),
         help=(
             "Typed block reason. 'dependency' waits in todo (auto-promoted "
-            "when parents finish, no human); 'needs_input'/'capability' go to "
-            "blocked for a human; 'transient' marks a maybe-flaky failure. "
-            "Repeated same-kind re-blocks after unblock route the task to "
-            "triage to break unblock loops. Omit for a generic block."
+            "when parents finish, no human); 'needs_input'/'capability'/'review-required' "
+            "go to blocked (or triage after recurrences) for a human; 'transient' "
+            "marks a maybe-flaky failure. Repeated same-kind re-blocks after "
+            "unblock route the task to triage to break unblock loops. "
+            "If --kind is omitted, a reason starting with a VALID_BLOCK_KIND: "
+            "prefix (e.g. \"review-required: eyes on PR\") is auto-detected; "
+            "the prefix is stripped from the stored reason. Explicit --kind "
+            "always wins and the reason is left as-is. Omit for a generic/legacy block."
         ),
     )
 

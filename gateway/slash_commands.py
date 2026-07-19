@@ -4615,6 +4615,7 @@ class GatewaySlashCommandsMixin:
             /approve all session  — approve all + remember for session
             /approve always       — approve oldest + remember permanently
             /approve all always   — approve all + remember permanently
+            /approve t_xxx [reason] — approve a blocked kanban review task
         """
         source = event.source
         session_key = self._session_key_for_source(source)
@@ -4623,10 +4624,31 @@ class GatewaySlashCommandsMixin:
             resolve_gateway_approval, has_blocking_approval, resolve_kanban_permission_approvals,
         )
 
+        raw_args = event.get_command_args().strip()
+        tokens = raw_args.split()
+        lower_tokens = [t.lower() for t in tokens]
+
+        # Contextual kanban task approve: /approve t_xxx [reason...]
+        # Only when no dangerous-command approval is pending (precedence rule).
+        task_id_token = next((t for t in tokens if t.startswith("t_") and len(t) >= 4), None)
+        if task_id_token and not has_blocking_approval(session_key):
+            reason_parts = [t for t in tokens if t != task_id_token]
+            reason = " ".join(reason_parts).strip() or None
+            try:
+                from hermes_cli.kanban import run_slash
+                cmd = f"approve {task_id_token}"
+                if reason:
+                    # Quote reason for shlex in run_slash
+                    cmd += f" --reason {shlex.quote(reason)}"
+                output = await asyncio.to_thread(run_slash, cmd)
+                return output
+            except Exception as exc:
+                logger.warning("kanban contextual /approve failed: %s", exc)
+                return f"Failed to approve {task_id_token}: {exc}"
+
         # Parse args early so we can use choice for both regular and kanban permission approvals (t_bb012ceb)
-        args = event.get_command_args().strip().lower().split()
-        resolve_all = "all" in args
-        remaining = [a for a in args if a != "all"]
+        resolve_all = "all" in lower_tokens
+        remaining = [a for a in lower_tokens if a != "all"]
 
         if any(a in {"always", "permanent", "permanently"} for a in remaining):
             choice = "always"
@@ -4674,6 +4696,10 @@ class GatewaySlashCommandsMixin:
         ``/deny <reason>`` (or ``/deny all <reason>``) attaches a one-line
         reason that is relayed back to the agent so it can adapt instead of
         only hearing "denied". Ported from qwibitai/nanoclaw#2832.
+
+        Also supports contextual kanban task deny:
+            /deny t_xxx [reason]
+        when no dangerous-command approval is pending.
         """
         source = event.source
         session_key = self._session_key_for_source(source)
@@ -4681,6 +4707,25 @@ class GatewaySlashCommandsMixin:
         from tools.approval import (
             resolve_gateway_approval, has_blocking_approval, resolve_kanban_permission_approvals,
         )
+
+        raw_args = event.get_command_args().strip()
+        tokens = raw_args.split()
+
+        # Contextual kanban task deny: /deny t_xxx [reason...]
+        task_id_token = next((t for t in tokens if t.startswith("t_") and len(t) >= 4), None)
+        if task_id_token and not has_blocking_approval(session_key):
+            reason_parts = [t for t in tokens if t != task_id_token]
+            reason = " ".join(reason_parts).strip() or None
+            try:
+                from hermes_cli.kanban import run_slash
+                cmd = f"deny {task_id_token}"
+                if reason:
+                    cmd += f" --reason {shlex.quote(reason)}"
+                output = await asyncio.to_thread(run_slash, cmd)
+                return output
+            except Exception as exc:
+                logger.warning("kanban contextual /deny failed: %s", exc)
+                return f"Failed to deny {task_id_token}: {exc}"
 
         if not has_blocking_approval(session_key):
             if session_key in self._pending_approvals:
@@ -4695,8 +4740,6 @@ class GatewaySlashCommandsMixin:
         # Parse args: a leading "all" token denies every pending command;
         # anything after it (or the whole arg string when "all" is absent) is
         # captured verbatim as the optional deny reason relayed to the agent.
-        raw_args = event.get_command_args().strip()
-        tokens = raw_args.split()
         resolve_all = bool(tokens) and tokens[0].lower() == "all"
         if resolve_all:
             reason = raw_args[len(tokens[0]):].strip()

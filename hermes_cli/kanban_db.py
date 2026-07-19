@@ -159,10 +159,11 @@ def parse_block_kind(
     """
     if kind is not None:
         return kind, reason
-    if not reason:
-        return None, reason
+    if reason is None:
+        return None, None
     r = str(reason).strip()
     if not r:
+        # Empty / whitespace-only reasons normalize to None (no kind, no text).
         return None, None
     lower_r = r.lower()
     for k in VALID_BLOCK_KINDS:
@@ -5336,7 +5337,8 @@ def approve_task(
        or ``scheduled``).
     2. Adds an audit comment ``APPROVED via gateway: {reason}``.
     3. Calls :func:`unblock_task` to flip status to ``ready``/``todo``.
-    4. Appends an ``approved`` event with actor + reason payload.
+    4. Appends an ``approved`` event with actor + reason + original block
+       kind payload.
 
     Returns ``(True, success_msg)`` on success or ``(False, error_msg)``
     when the task is not approvable (not found, not blocked, already
@@ -5350,9 +5352,11 @@ def approve_task(
     if not actor or not actor.strip():
         return False, "actor is required"
     actor = actor.strip()
-    # Validate task exists and check current status
+    # Validate task exists and check current status (+ capture block_kind
+    # for the audit event before unblock clears it).
     row = conn.execute(
-        "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        "SELECT status, block_kind FROM tasks WHERE id = ?",
+        (task_id,),
     ).fetchone()
     if row is None:
         return False, f"task {task_id} not found"
@@ -5362,6 +5366,7 @@ def approve_task(
             f"task {task_id} is {cur_status!r}; "
             f"approve only applies to 'blocked' or 'scheduled' tasks"
         )
+    prior_kind = row["block_kind"] if "block_kind" in row.keys() else None
     reason = reason.strip() if reason and reason.strip() else None
     with write_txn(conn):
         # Add audit comment
@@ -5373,10 +5378,14 @@ def approve_task(
             # Task changed state during our txn — already terminal or
             # parents changed. Leave the comment but report failure.
             return False, f"task {task_id} was already unblocked or changed state"
-        # Record approval event
+        # Record approval event (include original block kind for audit)
         _append_event(
             conn, task_id, "approved",
-            {"actor": actor, "reason": reason},
+            {
+                "actor": actor,
+                "reason": reason,
+                "kind": prior_kind,
+            },
         )
     return True, f"approved {task_id}"
 
@@ -5396,7 +5405,7 @@ def deny_task(
 
     1. Validates the task exists and is in a blockable state.
     2. Adds an audit comment ``DENIED via gateway: {reason}``.
-    3. Appends a ``denied`` event with actor + reason payload.
+    3. Appends a ``denied`` event with actor + reason + original block kind.
     4. Leaves the task in ``blocked`` status.
 
     Returns ``(True, success_msg)`` on success or ``(False, error_msg)``
@@ -5407,7 +5416,8 @@ def deny_task(
     actor = actor.strip()
     # Validate task exists and check current status
     row = conn.execute(
-        "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        "SELECT status, block_kind FROM tasks WHERE id = ?",
+        (task_id,),
     ).fetchone()
     if row is None:
         return False, f"task {task_id} not found"
@@ -5417,6 +5427,7 @@ def deny_task(
             f"task {task_id} is {cur_status!r}; "
             f"deny only applies to 'blocked' or 'scheduled' tasks"
         )
+    prior_kind = row["block_kind"] if "block_kind" in row.keys() else None
     reason = reason.strip() if reason and reason.strip() else None
     with write_txn(conn):
         # Add audit comment
@@ -5425,7 +5436,11 @@ def deny_task(
         # Record denial event (task stays blocked)
         _append_event(
             conn, task_id, "denied",
-            {"actor": actor, "reason": reason},
+            {
+                "actor": actor,
+                "reason": reason,
+                "kind": prior_kind,
+            },
         )
     return True, f"denied {task_id}"
 

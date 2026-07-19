@@ -170,9 +170,17 @@ class GatewayKanbanWatchersMixin:
         except Exception:
             logger.warning("kanban notifier: config loader unavailable; disabled")
             return
-        env_override = os.environ.get("HERMES_KANBAN_DISPATCH_IN_GATEWAY", "").strip().lower()
-        if env_override in {"0", "false", "no", "off"}:
-            logger.info("kanban notifier: disabled via HERMES_KANBAN_DISPATCH_IN_GATEWAY env")
+        # Notifier can run independently of the embedded dispatcher so cron-driven
+        # dispatch (dispatch_in_gateway=false) still delivers approval pings to
+        # Telegram/Zulip. Precedence:
+        #   1. HERMES_KANBAN_NOTIFIER_IN_GATEWAY env (on/off)
+        #   2. kanban.notifier_in_gateway config bool
+        #   3. fall back to kanban.dispatch_in_gateway (legacy coupling)
+        #   4. HERMES_KANBAN_DISPATCH_IN_GATEWAY env as legacy off-switch
+        env_notifier = os.environ.get("HERMES_KANBAN_NOTIFIER_IN_GATEWAY", "").strip().lower()
+        env_dispatch = os.environ.get("HERMES_KANBAN_DISPATCH_IN_GATEWAY", "").strip().lower()
+        if env_notifier in {"0", "false", "no", "off"}:
+            logger.info("kanban notifier: disabled via HERMES_KANBAN_NOTIFIER_IN_GATEWAY env")
             return
         try:
             cfg = _load_config()
@@ -180,11 +188,25 @@ class GatewayKanbanWatchersMixin:
             logger.warning("kanban notifier: cannot load config (%s); disabled", exc)
             return
         kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
-        if not kanban_cfg.get("dispatch_in_gateway", True):
+        if env_notifier in {"1", "true", "yes", "on"}:
+            notifier_enabled = True
+        elif isinstance(kanban_cfg, dict) and "notifier_in_gateway" in kanban_cfg:
+            notifier_enabled = bool(kanban_cfg.get("notifier_in_gateway"))
+        elif env_dispatch in {"0", "false", "no", "off"}:
+            notifier_enabled = False
+        else:
+            notifier_enabled = bool(kanban_cfg.get("dispatch_in_gateway", True))
+        if not notifier_enabled:
             logger.info(
-                "kanban notifier: disabled via config kanban.dispatch_in_gateway=false"
+                "kanban notifier: disabled (set kanban.notifier_in_gateway=true "
+                "to deliver approvals while dispatch_in_gateway=false)"
             )
             return
+        logger.info(
+            "kanban notifier: enabled (dispatch_in_gateway=%s notifier_in_gateway=%s)",
+            kanban_cfg.get("dispatch_in_gateway", True) if isinstance(kanban_cfg, dict) else True,
+            kanban_cfg.get("notifier_in_gateway") if isinstance(kanban_cfg, dict) else None,
+        )
 
         # Load notification_sources allowlist (or wildcard) so the notifier
         # can accept cross-profile Kanban subscriptions.  See kanban-worker
@@ -222,7 +244,10 @@ class GatewayKanbanWatchersMixin:
 
         # "status" covers dashboard drag-drop and `_set_status_direct()`
         # writes — surface those transitions to subscribers too.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked")
+        TERMINAL_KINDS = (
+            "completed", "blocked", "gave_up", "crashed", "timed_out",
+            "status", "archived", "unblocked", "approved", "denied",
+        )
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -451,6 +476,12 @@ class GatewayKanbanWatchersMixin:
                         # chat subscribes to many tasks) legible at a glance.
                         who = (task.assignee if task and task.assignee else None)
                         tag = f"@{who} " if who else ""
+                        # Default False for every event kind. Only the
+                        # blocked branch may set this True; the auto-sub
+                        # check below reads it for all kinds, so leaving
+                        # it unbound crashes the whole tick (UnboundLocalError)
+                        # and silently drops every notification.
+                        is_approval_block = False
                         if kind == "completed":
                             # Prefer the run's summary (the worker's
                             # intentional human-facing handoff, carried
@@ -516,6 +547,30 @@ class GatewayKanbanWatchersMixin:
                                 msg = "\n".join(lines)
                             else:
                                 msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
+                        elif kind == "approved":
+                            actor = ""
+                            reason_txt = ""
+                            if ev.payload:
+                                if ev.payload.get("actor"):
+                                    actor = f" by {ev.payload['actor']}"
+                                if ev.payload.get("reason"):
+                                    reason_txt = f": {str(ev.payload['reason'])[:160]}"
+                            msg = (
+                                f"✅ {board_tag}{tag}Kanban {sub['task_id']} approved{actor}"
+                                f"{reason_txt}"
+                            )
+                        elif kind == "denied":
+                            actor = ""
+                            reason_txt = ""
+                            if ev.payload:
+                                if ev.payload.get("actor"):
+                                    actor = f" by {ev.payload['actor']}"
+                                if ev.payload.get("reason"):
+                                    reason_txt = f": {str(ev.payload['reason'])[:160]}"
+                            msg = (
+                                f"❌ {board_tag}{tag}Kanban {sub['task_id']} denied{actor}"
+                                f"{reason_txt} (still blocked)"
+                            )
                         elif kind == "gave_up":
                             err = ""
                             if ev.payload and ev.payload.get("error"):
@@ -554,18 +609,41 @@ class GatewayKanbanWatchersMixin:
                             # also excluded from _WAKE_KINDS below, so they
                             # never wake the creator.
                             continue
-                        # Auto-subscribe on human-review blocks if enabled
+                        # Auto-subscribe on human-review blocks if enabled.
+                        # Delivery runs after the collector closes the board
+                        # connection, so open a short-lived conn here.
                         if is_approval_block and kind == "blocked":
                             try:
-                                self._kanban_auto_subscribe(
-                                    conn,
-                                    task_id=sub["task_id"],
-                                    platform=platform_str,
-                                    chat_id=sub["chat_id"],
-                                    thread_id=sub.get("thread_id"),
-                                    board=board_slug,
-                                    auto_subscribe_cfg=auto_subscribe_enabled,
-                                )
+                                _task_id = sub["task_id"]
+                                _plat = platform_str
+                                _chat = sub["chat_id"]
+                                _thread = sub.get("thread_id")
+                                _board = board_slug
+                                _auto_cfg = auto_subscribe_enabled
+
+                                def _auto_sub(
+                                    task_id=_task_id,
+                                    platform=_plat,
+                                    chat_id=_chat,
+                                    thread_id=_thread,
+                                    board=_board,
+                                    auto_cfg=_auto_cfg,
+                                ):
+                                    from hermes_cli import kanban_db as _kb
+                                    c = _kb.connect(board=board)
+                                    try:
+                                        return self._kanban_auto_subscribe(
+                                            c,
+                                            task_id=task_id,
+                                            platform=platform,
+                                            chat_id=chat_id,
+                                            thread_id=thread_id,
+                                            board=board,
+                                            auto_subscribe_cfg=auto_cfg,
+                                        )
+                                    finally:
+                                        c.close()
+                                await asyncio.to_thread(_auto_sub)
                             except Exception as _as_exc:
                                 logger.warning(
                                     "kanban notifier: auto-subscribe check failed for %s: %s",

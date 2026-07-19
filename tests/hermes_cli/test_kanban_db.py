@@ -1332,6 +1332,29 @@ def test_block_then_unblock(kanban_home):
         assert kb.get_task(conn, t).status == "ready"
 
 
+def test_block_task_parse_prefix_reason(kanban_home):
+    """block_task with prefixed reason (kind=None) auto-parses via parse_block_kind.
+
+    block_kind is set, the (stripped) reason is used for events/runs/summary.
+    (CLI adds the raw-prefixed comment before calling block_task for back-compat.)
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="prefix block", assignee="a")
+        kb.claim_task(conn, t)
+        ok = kb.block_task(conn, t, reason="review-required: sign-off", kind=None)
+        assert ok is True
+        task = kb.get_task(conn, t)
+        assert task.status == "blocked"
+        assert task.block_kind == "review-required"
+        # reason stored in the ended run summary is the stripped one
+        run = kb.latest_run(conn, t)
+        if run and run.summary:
+            assert "review-required" not in (run.summary or "")
+            assert "sign-off" in (run.summary or "")
+        # re-open to check no breakage on persisted data
+        assert kb.get_task(conn, t).block_kind == "review-required"
+
+
 def test_unblock_resets_failure_counters(kanban_home):
     """unblock_task must reset consecutive_failures and last_failure_error."""
     with kb.connect() as conn:

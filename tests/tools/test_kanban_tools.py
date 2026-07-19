@@ -733,6 +733,24 @@ def test_block_happy_path(worker_env):
         conn.close()
 
 
+def test_block_prefix_reason_auto_detects_kind(worker_env):
+    """Prefix in reason (no kind arg) is parsed before gate/payload."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    out = kt._handle_block({"reason": "needs_input: choose key?"})
+    d = json.loads(out)
+    assert d.get("ok") is True
+    assert d.get("block_kind") == "needs_input"
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert task.status == "blocked"
+        assert task.block_kind == "needs_input"
+    finally:
+        conn.close()
+
+
 def test_block_rejects_empty_reason(worker_env):
     from tools import kanban_tools as kt
     for bad in ["", "   ", None]:

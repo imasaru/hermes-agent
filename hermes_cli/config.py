@@ -2833,6 +2833,11 @@ DEFAULT_CONFIG = {
         # only if you run the dispatcher as a separate systemd unit or
         # don't want the gateway to spawn workers.
         "dispatch_in_gateway": True,
+        # Deliver kanban event notifications (including approval pings)
+        # from the gateway. Defaults to following dispatch_in_gateway when
+        # unset. Set true with dispatch_in_gateway=false when cron owns
+        # dispatch but chat still needs approval/block notifications.
+        # "notifier_in_gateway": True,
         # Seconds between dispatcher ticks (idle or not). Lower = snappier
         # pickup of newly-ready tasks; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,

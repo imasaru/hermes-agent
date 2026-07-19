@@ -5157,7 +5157,7 @@ class TelegramAdapter(BasePlatformAdapter):
             lines.append("")
             lines.append("Choose an action below or use the slash commands:")
             lines.append("  <code>/kanban approve {task_id}</code>")
-            lines.append("  <code>/kanban deny {task_id} "reason"</code>")
+            lines.append('  <code>/kanban deny {task_id} "reason"</code>')
 
             text = "\n".join(lines)
 

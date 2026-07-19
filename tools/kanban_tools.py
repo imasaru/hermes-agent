@@ -690,6 +690,9 @@ def _handle_block(args: dict, **kw) -> str:
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
+        # Early parse so prefix auto-detect (e.g. "needs_input: ...") sets
+        # kind before the goal_mode gate and before block_task / return payload.
+        kind, reason = kb.parse_block_kind(reason, kind)
         if kind is not None and kind not in kb.VALID_BLOCK_KINDS:
             conn.close()
             return tool_error(
