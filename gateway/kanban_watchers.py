@@ -435,6 +435,7 @@ class GatewayKanbanWatchersMixin:
         TERMINAL_KINDS = (
             "completed", "blocked", "gave_up", "crashed", "timed_out",
             "status", "archived", "unblocked", "approved", "denied",
+            "permission_approval_requested",
         )
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal

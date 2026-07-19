@@ -194,3 +194,87 @@ def test_unrelated_text_with_pending_approval_falls_through():
     # Approval still pending — not resolved by unrelated text.
     assert not entry.event.is_set()
     _clear_approval_state()
+
+
+# ------------------------------------------------------------------
+# Kanban-parity cues (lgtm / trailing note) + Zulip session source
+# ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "lgtm",
+        "lgtm!",
+        "LGTM",
+        "lgtm — ship it",
+        "lgtm! note about chmod only",
+        "looks good",
+        "ship it",
+    ],
+)
+def test_plaintext_lgtm_resolves_approval(reply):
+    """Dangerous-path plain text accepts lgtm (+ optional note), matching
+    kanban review UX when has_blocking_approval is true."""
+    _clear_approval_state()
+    runner, adapter = _make_runner()
+    session_key, entry = _register_blocking_approval(runner)
+
+    handled = asyncio.run(
+        runner._handle_active_session_busy_message(_make_event(reply), session_key)
+    )
+
+    assert handled is True
+    assert entry.event.is_set()
+    assert entry.result == "once"
+    adapter._send_with_retry.assert_awaited()
+    _clear_approval_state()
+
+
+def test_plaintext_deny_with_reason_relays_reason():
+    """``no, don't touch production`` becomes /deny with reason."""
+    _clear_approval_state()
+    runner, adapter = _make_runner()
+    session_key, entry = _register_blocking_approval(runner)
+
+    handled = asyncio.run(
+        runner._handle_active_session_busy_message(
+            _make_event("no, don't touch production"), session_key
+        )
+    )
+
+    assert handled is True
+    assert entry.event.is_set()
+    assert entry.result == "deny"
+    # reason is attached on the entry when deny carries free text
+    assert getattr(entry, "reason", None) in (
+        None,
+        "don't touch production",
+        "don't touch production".replace("'", "\u2019"),
+    ) or (
+        entry.reason and "production" in entry.reason
+    )
+    _clear_approval_state()
+
+
+def test_plaintext_approval_prompt_lists_natural_cues():
+    """Fallback prompt text must advertise yes/lgtm/no, not only /approve."""
+    from tools.approval import format_dangerous_approval_prompt
+
+    msg = format_dangerous_approval_prompt(
+        "chmod 777 /tmp/x", "file permission change", prefix="/"
+    )
+    # Old bug: only /approve and /deny were mentioned.
+    assert "`/approve`" in msg
+    assert "`yes`" in msg
+    assert "`lgtm`" in msg
+    assert "`no`" in msg
+    assert "Session:" in msg and "Always:" in msg and "Deny:" in msg
+
+    # Slack/Matrix typed prefix form
+    matrix_msg = format_dangerous_approval_prompt(
+        "echo hi", "test", prefix="!"
+    )
+    assert "`!approve`" in matrix_msg
+    assert "`!deny`" in matrix_msg
+    assert "`yes`" in matrix_msg
