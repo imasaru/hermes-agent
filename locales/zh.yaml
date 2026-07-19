@@ -315,6 +315,7 @@ Future messages in this room will use that transcript until `/reset` or another 
     warn_prefix:           "⚠️ {error}"
     empty_after_clean:     "⚠️ 清理后标题为空。请使用可打印字符。"
     set_to:                "✏️ 已设置会话标题：**{title}**"
+    zulip_topic_rename_failed: "⚠️ 会话标题已保存，但 Zulip 主题重命名失败：{detail}"
     not_found:             "未在数据库中找到该会话。"
     current_with_title:    "📌 会话：`{session_id}`\n标题：**{title}**"
     current_no_title:      "📌 会话：`{session_id}`\n尚未设置标题。用法：`/title 我的会话名称`"

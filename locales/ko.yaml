@@ -315,6 +315,7 @@ Future messages in this room will use that transcript until `/reset` or another 
     warn_prefix:           "⚠️ {error}"
     empty_after_clean:     "⚠️ 정리 후 제목이 비어 있습니다. 인쇄 가능한 문자를 사용해 주세요."
     set_to:                "✏️ 세션 제목 설정됨: **{title}**"
+    zulip_topic_rename_failed: "⚠️ 세션 제목은 저장되었지만 Zulip 토픽 이름 변경에 실패했습니다: {detail}"
     not_found:             "데이터베이스에서 세션을 찾을 수 없습니다."
     current_with_title:    "📌 세션: `{session_id}`\n제목: **{title}**"
     current_no_title:      "📌 세션: `{session_id}`\n제목이 설정되지 않았습니다. 사용법: `/title 내 세션 이름`"

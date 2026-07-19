@@ -315,6 +315,7 @@ Future messages in this room will use that transcript until `/reset` or another 
     warn_prefix:           "⚠️ {error}"
     empty_after_clean:     "⚠️ O título está vazio após a limpeza. Usa caracteres imprimíveis."
     set_to:                "✏️ Título da sessão definido: **{title}**"
+    zulip_topic_rename_failed: "⚠️ Título da sessão salvo, mas a renomeação do tópico do Zulip falhou: {detail}"
     not_found:             "Sessão não encontrada na base de dados."
     current_with_title:    "📌 Sessão: `{session_id}`\nTítulo: **{title}**"
     current_no_title:      "📌 Sessão: `{session_id}`\nSem título. Uso: `/title O meu nome de sessão`"

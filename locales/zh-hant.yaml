@@ -315,6 +315,7 @@ Future messages in this room will use that transcript until `/reset` or another 
     warn_prefix:           "⚠️ {error}"
     empty_after_clean:     "⚠️ 清理後標題為空。請使用可列印字元。"
     set_to:                "✏️ 已設定工作階段標題：**{title}**"
+    zulip_topic_rename_failed: "⚠️ 工作階段標題已儲存，但 Zulip 主題重新命名失敗：{detail}"
     not_found:             "在資料庫中找不到此工作階段。"
     current_with_title:    "📌 工作階段：`{session_id}`\n標題：**{title}**"
     current_no_title:      "📌 工作階段：`{session_id}`\n尚未設定標題。用法：`/title 我的工作階段名稱`"

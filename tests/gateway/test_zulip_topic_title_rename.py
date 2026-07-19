@@ -145,11 +145,13 @@ async def test_rename_zulip_topic_calls_adapter_and_rekeys(tmp_path: Path):
     runner._running_agents[old_key] = "agent-obj"
     runner._agent_cache[old_key] = ("cached",)
 
-    await runner._rename_zulip_topic_for_session_title(
+    status, detail = await runner._rename_zulip_topic_for_session_title(
         source,
         entry.session_id,
         "Fresh Session Title",
     )
+    assert status == "ok"
+    assert detail == ""
 
     adapter.rename_topic.assert_awaited_once_with(
         chat_id="12345",
@@ -178,7 +180,10 @@ async def test_rename_zulip_topic_dm_noop(tmp_path: Path):
     runner = _make_runner(session_store=store, adapters={platform: adapter})
     source = _make_source(chat_id="dm:1", chat_type="dm", thread_id=None)
 
-    await runner._rename_zulip_topic_for_session_title(source, "sess", "Title")
+    status, detail = await runner._rename_zulip_topic_for_session_title(
+        source, "sess", "Title"
+    )
+    assert status == "noop"
     adapter.rename_topic.assert_not_called()
 
 
@@ -194,14 +199,36 @@ async def test_rename_zulip_topic_adapter_failure_is_soft(tmp_path: Path):
     adapter.rename_topic = AsyncMock(side_effect=RuntimeError("network"))
     runner = _make_runner(session_store=store, adapters={platform: adapter})
 
-    await runner._rename_zulip_topic_for_session_title(
+    status, detail = await runner._rename_zulip_topic_for_session_title(
         source, entry.session_id, "Title"
     )
+    assert status == "failed"
+    assert "network" in detail
     assert store.peek_session_id(old_key) == entry.session_id
 
 
 @pytest.mark.asyncio
-async def test_title_command_schedules_zulip_rename(tmp_path: Path):
+async def test_rename_zulip_topic_adapter_tuple_failure_detail(tmp_path: Path):
+    store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+    source = _make_source(thread_id="old-topic")
+    entry = store.get_or_create_session(source)
+
+    platform = _zulip_platform()
+    adapter = MagicMock()
+    adapter.rename_topic = AsyncMock(
+        return_value=(False, "You don't have permission to move this message")
+    )
+    runner = _make_runner(session_store=store, adapters={platform: adapter})
+
+    status, detail = await runner._rename_zulip_topic_for_session_title(
+        source, entry.session_id, "Title"
+    )
+    assert status == "failed"
+    assert "permission" in detail.lower()
+
+
+@pytest.mark.asyncio
+async def test_title_command_awaits_zulip_rename_and_surfaces_failure(tmp_path: Path):
     from hermes_state import AsyncSessionDB, SessionDB
     from gateway.run import GatewayRunner
 
@@ -218,16 +245,48 @@ async def test_title_command_schedules_zulip_rename(tmp_path: Path):
     mock_store.get_or_create_session.return_value = mock_entry
     runner.session_store = mock_store
     runner._schedule_telegram_topic_title_rename = MagicMock()
-    runner._schedule_zulip_topic_title_rename = MagicMock()
+    runner._rename_zulip_topic_for_session_title = AsyncMock(
+        return_value=("failed", "You don't have permission to move this message")
+    )
 
     source = _make_source(thread_id="handoff")
     event = MessageEvent(text="/title My Zulip Title", source=source)
     result = await runner._handle_title_command(event)
 
     assert "My Zulip Title" in result
-    runner._schedule_zulip_topic_title_rename.assert_called_once_with(
+    assert "permission" in result.lower() or "rename failed" in result.lower()
+    runner._rename_zulip_topic_for_session_title.assert_awaited_once_with(
         source, "test_session_123", "My Zulip Title"
     )
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_title_command_success_omits_fail_note(tmp_path: Path):
+    from hermes_state import AsyncSessionDB, SessionDB
+    from gateway.run import GatewayRunner
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("test_session_123", "zulip")
+
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {}
+    runner._voice_mode = {}
+    runner._session_db = AsyncSessionDB(db)
+    mock_entry = MagicMock()
+    mock_entry.session_id = "test_session_123"
+    mock_store = MagicMock()
+    mock_store.get_or_create_session.return_value = mock_entry
+    runner.session_store = mock_store
+    runner._schedule_telegram_topic_title_rename = MagicMock()
+    runner._rename_zulip_topic_for_session_title = AsyncMock(return_value=("ok", ""))
+
+    source = _make_source(thread_id="handoff")
+    event = MessageEvent(text="/title My Zulip Title", source=source)
+    result = await runner._handle_title_command(event)
+
+    assert "My Zulip Title" in result
+    assert "rename failed" not in result.lower()
     db.close()
 
 
@@ -249,9 +308,9 @@ async def test_title_show_does_not_schedule_zulip_rename(tmp_path: Path):
     mock_store = MagicMock()
     mock_store.get_or_create_session.return_value = mock_entry
     runner.session_store = mock_store
-    runner._schedule_zulip_topic_title_rename = MagicMock()
+    runner._rename_zulip_topic_for_session_title = AsyncMock()
 
     event = MessageEvent(text="/title", source=_make_source())
     await runner._handle_title_command(event)
-    runner._schedule_zulip_topic_title_rename.assert_not_called()
+    runner._rename_zulip_topic_for_session_title.assert_not_called()
     db.close()

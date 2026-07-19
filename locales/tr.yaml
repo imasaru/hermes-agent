@@ -315,6 +315,7 @@ Future messages in this room will use that transcript until `/reset` or another 
     warn_prefix:           "⚠️ {error}"
     empty_after_clean:     "⚠️ Temizlemeden sonra başlık boş. Lütfen yazdırılabilir karakterler kullanın."
     set_to:                "✏️ Oturum başlığı ayarlandı: **{title}**"
+    zulip_topic_rename_failed: "⚠️ Oturum başlığı kaydedildi, ancak Zulip konu yeniden adlandırması başarısız: {detail}"
     not_found:             "Oturum veritabanında bulunamadı."
     current_with_title:    "📌 Oturum: `{session_id}`\nBaşlık: **{title}**"
     current_no_title:      "📌 Oturum: `{session_id}`\nBaşlık ayarlanmamış. Kullanım: `/title Oturum Adım`"

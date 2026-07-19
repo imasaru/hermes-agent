@@ -315,6 +315,7 @@ Future messages in this room will use that transcript until `/reset` or another 
     warn_prefix:           "⚠️ {error}"
     empty_after_clean:     "⚠️ Tisztítás után a cím üres. Használj nyomtatható karaktereket."
     set_to:                "✏️ Munkamenet címe beállítva: **{title}**"
+    zulip_topic_rename_failed: "⚠️ Munkamenet cím mentve, de a Zulip téma átnevezése sikertelen: {detail}"
     not_found:             "A munkamenet nem található az adatbázisban."
     current_with_title:    "📌 Munkamenet: `{session_id}`\nCím: **{title}**"
     current_no_title:      "📌 Munkamenet: `{session_id}`\nNincs cím beállítva. Használat: `/title Saját munkamenet neve`"

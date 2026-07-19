@@ -327,6 +327,7 @@ gateway:
     warn_prefix:           "⚠️ {error}"
     empty_after_clean:     "⚠️ Title is empty after cleanup. Please use printable characters."
     set_to:                "✏️ Session title set: **{title}**"
+    zulip_topic_rename_failed: "⚠️ Session title saved, but Zulip topic rename failed: {detail}"
     not_found:             "Session not found in database."
     current_with_title:    "📌 Session: `{session_id}`\nTitle: **{title}**"
     current_no_title:      "📌 Session: `{session_id}`\nNo title set. Usage: `/title My Session Name`"

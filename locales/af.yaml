@@ -315,6 +315,7 @@ Future messages in this room will use that transcript until `/reset` or another 
     warn_prefix:           "⚠️ {error}"
     empty_after_clean:     "⚠️ Titel is leeg na opruiming. Gebruik asseblief drukbare karakters."
     set_to:                "✏️ Sessie-titel gestel: **{title}**"
+    zulip_topic_rename_failed: "⚠️ Sessie-titel gestoor, maar Zulip-onderwerp hernoem het misluk: {detail}"
     not_found:             "Sessie nie in databasis gevind nie."
     current_with_title:    "📌 Sessie: `{session_id}`\nTitel: **{title}**"
     current_no_title:      "📌 Sessie: `{session_id}`\nGeen titel gestel nie. Gebruik: `/title My Sessie Naam`"

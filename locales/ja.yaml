@@ -315,6 +315,7 @@ Future messages in this room will use that transcript until `/reset` or another 
     warn_prefix:           "⚠️ {error}"
     empty_after_clean:     "⚠️ クリーンアップ後にタイトルが空になりました。印字可能な文字を使用してください。"
     set_to:                "✏️ セッションタイトルを設定しました: **{title}**"
+    zulip_topic_rename_failed: "⚠️ セッションタイトルは保存しましたが、Zulip トピックの改名に失敗しました: {detail}"
     not_found:             "データベースにセッションが見つかりません。"
     current_with_title:    "📌 セッション: `{session_id}`\nタイトル: **{title}**"
     current_no_title:      "📌 セッション: `{session_id}`\nタイトル未設定。使い方: `/title セッション名`"

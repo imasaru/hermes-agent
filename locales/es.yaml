@@ -312,6 +312,7 @@ gateway:
     warn_prefix:           "⚠️ {error}"
     empty_after_clean:     "⚠️ El título está vacío tras la limpieza. Usa caracteres imprimibles."
     set_to:                "✏️ Título de sesión establecido: **{title}**"
+    zulip_topic_rename_failed: "⚠️ Título de sesión guardado, pero falló el renombrado del tema de Zulip: {detail}"
     not_found:             "Sesión no encontrada en la base de datos."
     current_with_title:    "📌 Sesión: `{session_id}`\nTítulo: **{title}**"
     current_no_title:      "📌 Sesión: `{session_id}`\nSin título. Uso: `/title Mi nombre de sesión`"

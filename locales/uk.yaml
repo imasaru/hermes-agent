@@ -315,6 +315,7 @@ Future messages in this room will use that transcript until `/reset` or another 
     warn_prefix:           "⚠️ {error}"
     empty_after_clean:     "⚠️ Після очищення назва порожня. Використовуйте друковані символи."
     set_to:                "✏️ Назву сеансу встановлено: **{title}**"
+    zulip_topic_rename_failed: "⚠️ Назву сеансу збережено, але перейменування теми Zulip не вдалося: {detail}"
     not_found:             "Сеанс не знайдено в базі даних."
     current_with_title:    "📌 Сеанс: `{session_id}`\nНазва: **{title}**"
     current_no_title:      "📌 Сеанс: `{session_id}`\nНазву не встановлено. Використання: `/title Назва мого сеансу`"
