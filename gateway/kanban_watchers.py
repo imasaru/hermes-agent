@@ -167,47 +167,40 @@ def _zulip_approval_topic(task_id: str, title: Optional[str] = None) -> str:
     return f"{tid}{sep}{title}"
 
 
-def _excerpt_task_body_for_approval(body: Optional[str], *, limit: int = 1800) -> str:
-    """Pick the most decision-relevant excerpt from a task body for chat pings.
+def _chunk_text_for_platform(text: str, *, limit: int = 9000) -> list[str]:
+    """Split long approval pings so Zulip/Telegram stay under message caps.
 
-    Prefers sections humans need to act on (options, how to decide, acceptance,
-    goal) over full dump. Falls back to head of body. Hard-capped at ``limit``.
+    Prefers paragraph boundaries; falls back to hard cuts. Each chunk is at
+    most ``limit`` characters.
     """
-    if not body or not str(body).strip():
-        return ""
-    raw = str(body).strip().replace("\r\n", "\n")
-    # Prefer fenced decision sections by heading keywords
-    import re
-    headings = list(re.finditer(
-        r"(?im)^(#{1,3}\s+|\*\*)?(what is this|goal|context|options?|option [abc]|how to decide|"
-        r"acceptance|work|background|decision|choose|prefer).*$",
-        raw,
-    ))
-    chunks: list[str] = []
-    if headings:
-        # Take from first matching heading through a few following sections
-        start = headings[0].start()
-        excerpt = raw[start:]
-        # Stop at a late "Out of scope" / "Refs" if present after some content
-        m_stop = re.search(
-            r"(?im)^#{1,3}\s+(out of scope|refs|references|related)\b",
-            excerpt[200:] if len(excerpt) > 200 else "",
-        )
-        if m_stop:
-            excerpt = excerpt[: 200 + m_stop.start()].rstrip()
-        chunks.append(excerpt)
-    else:
-        chunks.append(raw)
-
-    text_out = "\n\n".join(chunks).strip()
-    if len(text_out) > limit:
-        cut = text_out[: max(0, limit - 20)].rstrip()
-        # break on paragraph if possible
-        nl = cut.rfind("\n\n")
-        if nl > limit // 2:
-            cut = cut[:nl].rstrip()
-        text_out = cut + "\n\n…(truncated — full body on task)"
-    return text_out
+    text = (text or "").strip()
+    if not text:
+        return []
+    if len(text) <= limit:
+        return [text]
+    parts: list[str] = []
+    rest = text
+    while rest:
+        if len(rest) <= limit:
+            parts.append(rest)
+            break
+        cut = rest[:limit]
+        # Prefer double newline, then single, then space
+        br = cut.rfind("\n\n")
+        if br < limit // 3:
+            br = cut.rfind("\n")
+        if br < limit // 3:
+            br = cut.rfind(" ")
+        if br < limit // 3:
+            br = limit
+        chunk = rest[:br].rstrip()
+        parts.append(chunk)
+        rest = rest[br:].lstrip()
+    # Annotate multi-part
+    if len(parts) > 1:
+        n = len(parts)
+        parts = [f"{p}\n\n_({i+1}/{n})_" for i, p in enumerate(parts)]
+    return parts
 
 
 def _format_human_review_block_message(
@@ -219,8 +212,14 @@ def _format_human_review_block_message(
     reason: str,
     task,
     recent_comments: Optional[list] = None,
-) -> str:
-    """Rich Zulip/Telegram body for needs_input / capability / review-required."""
+    platform: str = "",
+) -> list[str]:
+    """Rich approval ping(s) for needs_input / capability / review-required.
+
+    Returns one or more message strings. Includes the **full** task body so
+    reviewers can decide entirely from chat (Zulip topic / Telegram).
+    Long payloads are split to respect platform message limits.
+    """
     kind_label = block_kind or "human-review"
     task_title = ""
     task_workspace = ""
@@ -228,72 +227,104 @@ def _format_human_review_block_message(
     if task is not None:
         task_title = task.title or ""
         task_workspace = task.workspace_path or ""
-        task_body = getattr(task, "body", None) or ""
+        task_body = (getattr(task, "body", None) or "") or ""
 
-    # Reason may already include a long worker handoff — allow more than 160.
     reason_full = ""
     if reason:
-        # reason arg includes leading ": " from caller sometimes; normalize
         r = reason[2:] if reason.startswith(": ") else reason
-        r = r.strip()
-        if len(r) > 900:
-            r = r[:880].rstrip() + "…"
-        reason_full = r
+        reason_full = r.strip()
 
-    lines = [
+    header: list[str] = [
         f"⏸ {board_tag}{tag}Kanban `{task_id}` blocked ({kind_label})",
     ]
     if task_title:
-        lines.append(f"**{task_title}**")
+        header.append(f"**{task_title}**")
     if reason_full:
-        lines.append("")
-        lines.append(f"**Why blocked:** {reason_full}")
+        header.append("")
+        header.append(f"**Why blocked:** {reason_full}")
 
-    body_ex = _excerpt_task_body_for_approval(task_body, limit=1800)
-    if body_ex:
-        lines.append("")
-        lines.append("**Context (from task body):**")
-        lines.append(body_ex)
+    body_section: list[str] = []
+    if task_body.strip():
+        body_section.append("")
+        body_section.append("**Full task body:**")
+        body_section.append(task_body.strip())
 
-    # Latest human/worker comments (often hold the real decision prompt)
+    comments_section: list[str] = []
     if recent_comments:
-        lines.append("")
-        lines.append("**Recent comments:**")
-        for c in recent_comments[-5:]:
-            author = getattr(c, "author", None) or (c.get("author") if isinstance(c, dict) else "?")
-            body = getattr(c, "body", None) or (c.get("body") if isinstance(c, dict) else "")
-            body = (body or "").strip()
-            if not body:
+        comments_section.append("")
+        comments_section.append("**Comments:**")
+        for c in recent_comments:
+            author = getattr(c, "author", None) or (
+                c.get("author") if isinstance(c, dict) else "?"
+            )
+            cbody = getattr(c, "body", None) or (
+                c.get("body") if isinstance(c, dict) else ""
+            )
+            cbody = (cbody or "").strip()
+            if not cbody:
                 continue
-            if len(body) > 400:
-                body = body[:380].rstrip() + "…"
-            lines.append(f"- **{author}:** {body}")
+            comments_section.append(f"- **{author}:** {cbody}")
 
+    footer: list[str] = []
     if task_workspace:
-        lines.append("")
-        lines.append(f"_Workspace:_ `{task_workspace}`")
-
-    lines.append("")
+        footer.append("")
+        footer.append(f"_Workspace:_ `{task_workspace}`")
+    footer.append("")
     if block_kind == "review-required":
-        lines.append(
+        footer.append(
             "Review required — approve promotes to ready and can respawn the worker."
         )
     elif block_kind == "needs_input":
-        lines.append(
+        footer.append(
             "Needs your input — reply with a decision (or approve/deny)."
         )
-    lines.append("")
-    lines.append("**Reply in this topic (natural language OK):**")
-    lines.append("- `lgtm! <notes for worker>` or `yes` / `approve`")
-    lines.append("- `deny <reason>` or `no, <reason>`")
-    lines.append("")
-    lines.append("**Commands:**")
-    lines.append(f"- `/kanban approve {task_id}`")
-    lines.append(f'- `/kanban deny {task_id} "reason"`')
-    lines.append(f"- `/kanban show {task_id}`")
-    return "\n".join(lines)
+    footer.append("")
+    footer.append("**Reply in this topic (natural language OK):**")
+    footer.append("- `lgtm! <notes for worker>` or `yes` / `approve`")
+    footer.append("- `deny <reason>` or `no, <reason>`")
+    footer.append("")
+    footer.append("**Commands:**")
+    footer.append(f"- `/kanban approve {task_id}`")
+    footer.append(f'- `/kanban deny {task_id} "reason"`')
+    footer.append(f"- `/kanban show {task_id}`")
 
+    # Assemble: if everything fits one message, single part; else
+    # part1 = header + start of body, continue body, end with comments+footer.
+    full = "\n".join(header + body_section + comments_section + footer)
+    plat = (platform or "").lower()
+    # Zulip ~10k; Telegram ~4096. Stay under with margin.
+    limit = 3500 if plat == "telegram" else 9000
+    if len(full) <= limit:
+        return [full]
 
+    # Multi-part: (1) header + body chunk(s) (2) comments+footer if needed
+    parts_out: list[str] = []
+    head = "\n".join(header) + "\n\n**Full task body:**\n"
+    body = task_body.strip() if task_body.strip() else "_(no body)_"
+    tail = "\n".join(comments_section + footer)
+
+    # Budget for body in first chunk after head
+    # Put body in its own chunks, then tail
+    body_chunks = _chunk_text_for_platform(body, limit=max(500, limit - len(head) - 80))
+    for i, bc in enumerate(body_chunks):
+        if i == 0:
+            parts_out.append(head + bc)
+        else:
+            parts_out.append(
+                f"⏸ `{task_id}` body continued:\n\n{bc}"
+            )
+    if tail.strip():
+        tail_chunks = _chunk_text_for_platform(tail.strip(), limit=limit)
+        parts_out.extend(tail_chunks)
+
+    # Re-number parts
+    n = len(parts_out)
+    if n > 1:
+        parts_out = [
+            (p if p.endswith(f"({i+1}/{n})_") else f"{p}\n\n_({i+1}/{n})_")
+            for i, p in enumerate(parts_out)
+        ]
+    return parts_out
 
 
 class GatewayKanbanWatchersMixin:
@@ -655,6 +686,7 @@ class GatewayKanbanWatchersMixin:
                         # it unbound crashes the whole tick (UnboundLocalError)
                         # and silently drops every notification.
                         is_approval_block = False
+                        extra_msgs: list[str] = []
                         if kind == "completed":
                             # Prefer the run's summary (the worker's
                             # intentional human-facing handoff, carried
@@ -710,7 +742,7 @@ class GatewayKanbanWatchersMixin:
                                             _bc.close()
                                     except Exception:
                                         recent_comments = []
-                                msg = _format_human_review_block_message(
+                                msg_parts = _format_human_review_block_message(
                                     board_tag=board_tag,
                                     tag=tag,
                                     task_id=sub["task_id"],
@@ -718,7 +750,12 @@ class GatewayKanbanWatchersMixin:
                                     reason=reason_raw,
                                     task=task,
                                     recent_comments=recent_comments,
+                                    platform=platform_str,
                                 )
+                                # First part is the primary msg for failure/
+                                # logging paths below; extras sent after.
+                                msg = msg_parts[0] if msg_parts else ""
+                                extra_msgs = msg_parts[1:] if len(msg_parts) > 1 else []
                             else:
                                 msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
                         elif kind == "approved":
@@ -863,6 +900,22 @@ class GatewayKanbanWatchersMixin:
                                 "kanban notifier: delivered %s event for %s to %s/%s on board %s",
                                 kind, sub["task_id"], platform_str, sub["chat_id"], board_slug,
                             )
+                            for _em_i, _em in enumerate(extra_msgs):
+                                try:
+                                    _er = await adapter.send(
+                                        sub["chat_id"], _em, metadata=metadata,
+                                    )
+                                    if _er is not None and not _er.success:
+                                        logger.warning(
+                                            "kanban notifier: extra part %s/%s failed for %s: %s",
+                                            _em_i + 2, len(extra_msgs) + 1,
+                                            sub["task_id"], getattr(_er, "error", None),
+                                        )
+                                except Exception as _em_exc:
+                                    logger.warning(
+                                        "kanban notifier: extra part send error for %s: %s",
+                                        sub["task_id"], _em_exc,
+                                    )
                             # After delivering the text notification, surface
                             # any artifact paths the worker referenced in
                             # ``kanban_complete(summary=..., artifacts=[...])``
