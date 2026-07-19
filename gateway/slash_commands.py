@@ -4784,15 +4784,44 @@ class GatewaySlashCommandsMixin:
 
         try:
             from hermes_cli.kanban import run_slash
+
+            # Record the human's original chat message on the task so the
+            # worker sees exactly what was said (not only the audit line).
+            human = (
+                getattr(source, "user_name", None)
+                or getattr(source, "user_id", None)
+                or "user"
+            )
+            raw_msg = (event.text or "").strip()
+            if raw_msg:
+                # Author is the human; body is the verbatim Zulip/Telegram text.
+                cmt = (
+                    f"comment --author {shlex.quote(str(human))} "
+                    f"{task_id} {shlex.quote(raw_msg)}"
+                )
+                if board:
+                    cmt = f"--board {board} {cmt}"
+                try:
+                    await asyncio.to_thread(run_slash, cmt)
+                except Exception as cmt_exc:
+                    logger.warning(
+                        "kanban natural: failed to mirror human message as comment: %s",
+                        cmt_exc,
+                    )
+
             cmd = f"{verb} {task_id}"
             if board:
                 cmd = f"--board {board} {verb} {task_id}"
-            if comment:
-                cmd += f" --reason {shlex.quote(comment)}"
+            # Prefer full original message as reason when present so the
+            # APPROVED/DENIED audit line carries the same guidance.
+            reason_text = raw_msg if raw_msg else comment
+            if reason_text:
+                cmd += f" --reason {shlex.quote(reason_text)}"
             output = await asyncio.to_thread(run_slash, cmd)
             logger.info(
-                "Kanban natural %s for %s board=%s (comment=%r) via %s/%s thread=%r",
-                verb, task_id, board, (comment or "")[:80], platform_str, chat_id, thread,
+                "Kanban natural %s for %s board=%s by %s (comment=%r) via %s/%s thread=%r",
+                verb, task_id, board, human, (comment or "")[:80],
+                platform_str, chat_id, thread,
             )
             return output
         except Exception as exc:
