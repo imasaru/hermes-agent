@@ -1559,6 +1559,14 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         # the exact member who scheduled the job — parity with send_message.
         origin_user_id = origin.get("user_id") if mirror_this_target else None
 
+        # Discover plugins so that plugin platforms (e.g. zulip) are registered
+        # with the platform registry before we try to resolve them.
+        try:
+            from hermes_cli.plugins import discover_plugins
+            discover_plugins()
+        except Exception:
+            pass
+
         # Built-in names resolve to their enum member; plugin platform names
         # create dynamic members via Platform._missing_().
         try:
