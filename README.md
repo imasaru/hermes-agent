@@ -16,6 +16,21 @@
   <a href="README.es.md"><img src="https://img.shields.io/badge/Lang-Español-orange?style=for-the-badge" alt="Español"></a>
 </p>
 
+> **📌 Fork notice**  
+> This is the maintained fork at https://github.com/imasaru/hermes-agent.  
+> `hermes update` pulls from `origin` (this fork).  
+> The official upstream (NousResearch/hermes-agent) is available as the `upstream` remote.  
+
+**Notable work carried on this fork:**
+- Kanban human-review approval flow (Zulip + Telegram natural-language approve/deny, Option A, full task body pings)  
+- Cross-profile Kanban notification sources  
+- Various macOS/local stability + plugin fixes  
+
+Branches with additional changes ready to merge/cherry-pick:  
+`feat/kanban-approval-flow`, `feat/notification-sources-39838`, `local/macmini`  
+
+(You can `git merge` or `git cherry-pick` them onto main when ready. To sync latest official changes later: `git fetch upstream && git merge upstream/main`.)
+
 **The self-improving AI agent built by [Nous Research](https://nousresearch.com).** It's the only agent with a built-in learning loop — it creates skills from experience, improves them during use, nudges itself to persist knowledge, searches its own past conversations, and builds a deepening model of who you are across sessions. Run it on a $5 VPS, a GPU cluster, or serverless infrastructure that costs nearly nothing when idle. It's not tied to your laptop — talk to it from Telegram while it works on a cloud VM.
 
 Use any model you want — [Nous Portal](https://portal.nousresearch.com), OpenRouter, OpenAI, your own endpoint, and [many others](https://hermes-agent.nousresearch.com/docs/integrations/providers). Switch with `hermes model` — no code changes, no lock-in.

@@ -71,6 +71,12 @@ cli-config.yaml
 
 # Skills Hub state (lives in ~/.hermes/skills/.hub/ at runtime, but just in case)
 skills/.hub/
+
+# Local scratch directory for throwaway / one-off files.
+# We move short-lived debug scripts, probes, and WIP here (e.g. restart-all-gateways.sh,
+# tmp_zulip_check.py) so they never pollute git status, never force an autostash during
+# `hermes update`, and are never accidentally committed.
+# This directory is already listed in .gitignore and lives at the repo root.
 ignored/
 .worktrees/
 environments/benchmarks/evals/
@@ -81,6 +87,10 @@ hermes_cli/web_dist/
 .web_ui_build.lock
 apps/desktop/build/
 apps/desktop/dist/
+
+# Local task/kanban scratch folders (not part of the source tree)
+.task/
+.tasks/
 
 # tsc-emitted artifacts (a stray `tsc -b` compiles into src/, and vite then
 # resolves the stale .js OVER the .tsx — never track these)
