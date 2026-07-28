@@ -190,7 +190,7 @@ ONESHOT_RUN_CLAIM_TTL_SECONDS = 1800
 # headroom over any healthy run before we treat a claim as stale.
 _ONESHOT_RUN_CLAIM_TTL_HEADROOM = 3
 
-_DEFAULT_CRON_INACTIVITY_TIMEOUT = 600.0
+_DEFAULT_CRON_INACTIVITY_TIMEOUT = 1200.0
 
 
 def _oneshot_run_claim_ttl_seconds() -> float:

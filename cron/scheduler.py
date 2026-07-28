@@ -3472,7 +3472,7 @@ def run_job(
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,
         # but a hung API call or stuck tool with no activity for the configured
-        # duration is caught and killed.  Default 600s (10 min inactivity);
+        # duration is caught and killed.  Default 1200s (20 min inactivity);
         # override via HERMES_CRON_TIMEOUT env var.  0 = unlimited.
         #
         # Uses the agent's built-in activity tracker (updated by
@@ -3483,12 +3483,12 @@ def run_job(
                 _cron_timeout = float(_raw_cron_timeout)
             except (ValueError, TypeError):
                 logger.warning(
-                    "Invalid HERMES_CRON_TIMEOUT=%r; using default 600s",
+                    "Invalid HERMES_CRON_TIMEOUT=%r; using default 1200s",
                     _raw_cron_timeout,
                 )
-                _cron_timeout = 600.0
+                _cron_timeout = 1200.0
         else:
-            _cron_timeout = 600.0
+            _cron_timeout = 1200.0
         _cron_inactivity_limit = _cron_timeout if _cron_timeout > 0 else None
         _POLL_INTERVAL = 5.0
         # Keep the one-shot run_claim fresh while the run is alive (#62002):
