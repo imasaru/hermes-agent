@@ -1,0 +1,11 @@
+# Carried development branches for this fork.
+# These are merged / cherry-picked into main via scripts/land-carried-work.sh.
+#
+# Preference order matters (earlier branches win on duplicate SHAs).
+#
+# The landing script now uses smarter deduplication (ancestor + git cherry
+# content match + ignored-carried-shas.txt), so old duplicate SHAs should
+# rarely appear anymore.
+
+feat/kanban-approval-flow
+local/macmini

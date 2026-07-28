@@ -1,0 +1,7 @@
+# SHAs listed here will be ignored by land-carried-work.sh.
+# Good for old duplicate commits that have been superseded by later landings.
+
+# Early notification_sources duplicates (v1/v2/v3)
+80dd535b4f7cdbd9a9d4e15de2fa1ac6c00e6d57
+0f78142aee53400b988b9ada4769adbc98865754
+061fced91c220883c4efd38faaafa167dc68e217
