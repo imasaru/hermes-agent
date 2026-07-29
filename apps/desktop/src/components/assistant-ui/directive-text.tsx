@@ -113,7 +113,7 @@ const SLASH_CHIP_VARIANT: Record<SlashChipKind, string> = {
 }
 
 export const SLASH_CHIP_BASE_CLASS =
-  'mx-0.5 inline-flex max-w-64 items-center gap-1 rounded px-1.5 py-0.5 align-middle text-[0.86em] font-medium leading-none'
+  'mx-0.5 inline-flex max-w-64 items-center gap-1 rounded px-1.5 py-0.5 align-[-0.12em] text-[0.86em] font-medium leading-none'
 
 export function slashChipClass(kind: SlashChipKind): string {
   return `${SLASH_CHIP_BASE_CLASS} ${SLASH_CHIP_VARIANT[kind]}`
@@ -145,9 +145,15 @@ const DirectiveIcon: FC<{ type: string; className?: string }> = ({
 
 /** Shared chip styling — used by both the rendered <DirectiveChip> and the
  * raw HTML composer chips in `rich-editor.ts`. Neutral subtle wash + plain
- * muted-foreground text so chips read as quiet tags on any bubble color. */
+ * muted-foreground text so chips read as quiet tags on any bubble color.
+ *
+ * `align-[-0.12em]` rather than `align-middle`: `middle` centers the pill on
+ * the x-height midpoint, which sits above the center of the surrounding text
+ * box, so the chip visibly rides low next to the words it's nestled in. The
+ * em nudge lands the chip's own text baseline on the line's baseline (measured
+ * to within 0.08px) without growing the line box. */
 export const DIRECTIVE_CHIP_CLASS =
-  'mx-0.5 inline-flex max-w-56 items-center gap-1 rounded px-1.5 py-0.5 align-middle text-[0.86em] font-normal leading-none bg-[color-mix(in_srgb,currentColor_8%,transparent)] text-muted-foreground'
+  'mx-0.5 inline-flex max-w-56 items-center gap-1 rounded px-1.5 py-0.5 align-[-0.12em] text-[0.86em] font-normal leading-none bg-[color-mix(in_srgb,currentColor_8%,transparent)] text-muted-foreground'
 
 /**
  * Parses our composer's `@type:value` references into directive segments
@@ -477,10 +483,10 @@ const DirectiveImage: FC<{ id: string; label: string }> = ({ id, label }) => {
   )
 }
 
-/** Opens the referenced session as a tab — same as middle-clicking its sidebar
- *  row. The tile store loads on click, not at import: the composer's rich
- *  editor pulls this module in, and a static import would boot the profile
- *  store (and its REST routing) along with it. */
+/** Opens the referenced session the way a sidebar ⌘-click would: jump to it if
+ *  it's already a tile/main, otherwise open a stacked tab (never steals main
+ *  from under the chat you're reading). Lazy-imports so the composer's rich
+ *  editor can pull this module in without booting the profile/REST stack. */
 function openSessionRef(value: string) {
   const { sessionId } = parseSessionRefValue(value)
 
@@ -489,7 +495,8 @@ function openSessionRef(value: string) {
   }
 
   triggerHaptic('selection')
-  void import('@/store/session-states').then(({ openSessionTile }) => openSessionTile(sessionId, 'center'))
+  // navigate is unused for the `tab` intent (focus-or-tile only).
+  void import('@/app/open-session').then(({ openSession }) => openSession(sessionId, () => undefined, 'tab'))
 }
 
 /** A `@session:<profile>/<id>` reference in the user transcript (directive
@@ -515,7 +522,7 @@ export const SessionRefLink: FC<{
 
   return (
     <a
-      className="link-chip font-semibold wrap-anywhere"
+      className="link-chip wrap-anywhere"
       href="#"
       onClick={event => {
         event.preventDefault()

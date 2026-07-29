@@ -958,12 +958,6 @@ def init_agent(
     agent._stream_writer_tls = threading.local()
     agent._stream_writer_dropped = 0
 
-    # Displayed reasoning text streamed during the current model response,
-    # captured only when a surface consumed it via a reasoning callback. Used
-    # by active-turn redirect to checkpoint what the user actually saw without
-    # ever persisting hidden provider reasoning.
-    agent._current_streamed_reasoning_text = ""
-
     # Optional current-turn user-message override used when the API-facing
     # user message intentionally differs from the persisted transcript
     # (e.g. CLI voice mode adds a temporary prefix for the live call only).
@@ -1162,6 +1156,10 @@ def init_agent(
             elif base_url_host_matches(effective_base, "chatgpt.com"):
                 from agent.auxiliary_client import _codex_cloudflare_headers
                 client_kwargs["default_headers"] = _codex_cloudflare_headers(api_key)
+            elif base_url_host_matches(effective_base, "x.ai"):
+                from tools.xai_http import hermes_xai_default_headers
+
+                client_kwargs["default_headers"] = hermes_xai_default_headers()
             elif "default_headers" not in client_kwargs:
                 # Fall back to profile.default_headers for providers that
                 # declare custom headers (e.g. Kimi User-Agent on non-kimi.com

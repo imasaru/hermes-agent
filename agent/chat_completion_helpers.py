@@ -1373,6 +1373,17 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
         from agent.redact import redact_sensitive_text
         _san_content = redact_sensitive_text(_san_content)
 
+    # NOTE (empty-content class fix): textless assistant turns are NOT padded
+    # here.  The single owner for "never send a turn strict wire validation
+    # rejects as empty" is ``repair_empty_non_final_messages`` in
+    # agent_runtime_helpers, which runs inside ``sanitize_api_messages`` — the
+    # unconditional pre-send chokepoint for both the main loop and the summary
+    # path.  Padding at write time was tried (a single-space pad, later a
+    # placeholder) and rejected: it forked the concept across three sites,
+    # broke codex commentary turns (content:'' is a designed state there), and
+    # a DB-side pad can't survive ``_rows_to_conversation``'s whitespace strip
+    # anyway.  Repair belongs at the send boundary, once.
+
     msg = {
         "role": "assistant",
         "content": _san_content,
@@ -3918,6 +3929,17 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     result["error"],
                 )
                 _stub_finish_reason = FINISH_REASON_LENGTH
+            # NOTE (empty-content class fix): the stub is deliberately allowed
+            # to carry empty content here.  The conversation loop's truncation
+            # path detects an EMPTY partial-stream stub (PARTIAL_STREAM_STUB_ID
+            # + no content) and skips appending it to history entirely — only
+            # the continuation nudge is sent.  Substituting placeholder text at
+            # this site was tried and reverted: it defeats that guard (the stub
+            # no longer looks empty), gets appended to history, and the
+            # placeholder leaks into the stitched final response via
+            # truncated_response_parts.  Transcripts that already carry a
+            # persisted empty turn are healed at the send boundary by
+            # ``repair_empty_non_final_messages`` (the single owner).
             _stub_msg = SimpleNamespace(
                 role="assistant", content=_partial_text, tool_calls=None,
                 reasoning_content=None,
