@@ -82,6 +82,81 @@ def _close_late_session_db_result(future: "concurrent.futures.Future") -> None:
         pass
 
 
+_ZULIP_SESSION_MAP_PATH = Path(
+    os.path.expanduser("~/.hermes/profiles/ai-agent/cron/zulip_session_map.json")
+)
+
+
+def _persist_zulip_session_map(zulip_msg_id: int, session_id: str) -> None:
+    """Append a zulip_msg_id → session_id mapping to the disk cache.
+
+    Called from ``_deliver_result`` after every successful Zulip delivery.
+    The file is a simple JSON dict {zulip_id: session_id} loaded by the
+    Zulip adapter at startup.  Reads are O(1) dict lookups; writes are
+    append-only with a lock-free read-modify-write (the file is tiny).
+    """
+    try:
+        if _ZULIP_SESSION_MAP_PATH.exists():
+            try:
+                data = json.loads(_ZULIP_SESSION_MAP_PATH.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                data = {}
+        else:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        data[str(zulip_msg_id)] = session_id
+        _ZULIP_SESSION_MAP_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _ZULIP_SESSION_MAP_PATH.write_text(
+            json.dumps(data, indent=2), encoding="utf-8"
+        )
+    except Exception as exc:
+        logger.warning(
+            "Job '%s': failed to persist zulip session map: %s",
+            zulip_msg_id, exc,
+        )
+
+
+def _persist_cron_zulip_session_mapping(
+    platform_name: str,
+    session_id: Optional[str],
+    result: Any,
+    adapters: Optional[dict],
+    job_id: str,
+) -> None:
+    """Persist Zulip msg_id -> cron session_id mapping for BOTH live adapter
+    and standalone delivery paths.
+
+    Called after successful Zulip delivery of a cron job's output. This ensures
+    that 📌/🔖 reactions and /reply on the delivered cron message can resolve
+    back to the original cron session instead of "no session cached".
+    """
+    if not (platform_name == "zulip" and session_id and result):
+        return
+    try:
+        if isinstance(result, dict):
+            zulip_msg_id = result.get("message_id") or result.get("id")
+        else:
+            zulip_msg_id = getattr(result, "message_id", None) or getattr(result, "id", None)
+        if zulip_msg_id:
+            _persist_zulip_session_map(int(zulip_msg_id), session_id)
+            # Also warm live adapter RAM cache if present (zero latency for immediate reactions)
+            if adapters and "zulip" in adapters:
+                try:
+                    adapters["zulip"]._zulip_to_session[int(zulip_msg_id)] = session_id
+                except Exception:
+                    pass
+            logger.debug(
+                "Job '%s': persisted Zulip session map %s -> %s (for bookmark/reply continuity)",
+                job_id, zulip_msg_id, session_id,
+            )
+    except Exception as e:
+        logger.warning(
+            "Job '%s': failed to persist zulip session mapping for cron output: %s",
+            job_id, e,
+        )
+
+
 def _set_cron_session_title(session_db, session_id, base_title):
     """Robustly title a finished cron session before it is closed.
 

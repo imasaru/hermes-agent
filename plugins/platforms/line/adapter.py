@@ -132,8 +132,10 @@ from gateway.config import Platform
 LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
 LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
 LINE_LOADING_URL = "https://api.line.me/v2/bot/chat/loading/start"
+LINE_MARK_AS_READ_URL = "https://api.line.me/v2/bot/chat/markAsRead"
 LINE_CONTENT_URL_FMT = "https://api-data.line.me/v2/bot/message/{message_id}/content"
 LINE_BOT_INFO_URL = "https://api.line.me/v2/bot/info"
+LINE_GROUP_MEMBER_PROFILE_URL_FMT = "https://api.line.me/v2/bot/group/{group_id}/member/{user_id}"
 
 # LINE Messaging API hard limits
 LINE_PER_BUBBLE_CHARS = 5000  # Hard limit per text message object
@@ -511,7 +513,8 @@ class _LineClient:
             "Content-Type": "application/json",
         }
 
-    async def reply(self, reply_token: str, messages: List[Dict[str, Any]]) -> None:
+    async def reply(self, reply_token: str, messages: List[Dict[str, Any]]) -> Optional[str]:
+        """Send reply. Returns the LINE-assigned message ID of the first sent message, if available."""
         import aiohttp
         timeout = aiohttp.ClientTimeout(total=self._timeout)
         async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
@@ -523,8 +526,15 @@ class _LineClient:
                 if resp.status >= 400:
                     body = await resp.text()
                     raise RuntimeError(f"LINE reply {resp.status}: {body[:200]}")
+                try:
+                    data = await resp.json()
+                    sent = (data or {}).get("sentMessages") or []
+                    return sent[0].get("id") if sent else None
+                except Exception:
+                    return None
 
-    async def push(self, chat_id: str, messages: List[Dict[str, Any]]) -> None:
+    async def push(self, chat_id: str, messages: List[Dict[str, Any]]) -> Optional[str]:
+        """Send push. Returns the LINE-assigned message ID of the first sent message, if available."""
         import aiohttp
         timeout = aiohttp.ClientTimeout(total=self._timeout)
         async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
@@ -536,6 +546,12 @@ class _LineClient:
                 if resp.status >= 400:
                     body = await resp.text()
                     raise RuntimeError(f"LINE push {resp.status}: {body[:200]}")
+                try:
+                    data = await resp.json()
+                    sent = (data or {}).get("sentMessages") or []
+                    return sent[0].get("id") if sent else None
+                except Exception:
+                    return None
 
     async def loading(self, chat_id: str, seconds: int = 60) -> None:
         """Loading indicator (DM only). LINE rejects this for groups/rooms."""
@@ -577,6 +593,44 @@ class _LineClient:
                         return None
                     data = await resp.json()
                     return data.get("userId")
+        except Exception:
+            return None
+
+    async def mark_read(self, mark_as_read_token: str) -> None:
+        """Mark a message as read in LINE (clears unread indicator).
+
+        LINE API: POST /v2/bot/chat/markAsRead
+        Body: {\"markAsReadToken\": \"token\"}
+        The markAsReadToken comes from the webhook message event.
+        """
+        import aiohttp
+        timeout = aiohttp.ClientTimeout(total=5.0)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                await session.post(
+                    LINE_MARK_AS_READ_URL,
+                    headers=self._headers,
+                    json={"markAsReadToken": mark_as_read_token},
+                )
+        except Exception as exc:
+            logger.debug("LINE mark_as_read failed: %s", exc)
+
+    async def get_group_member_profile(self, group_id: str, user_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch a user's profile in a LINE group.
+
+        LINE API: GET /v2/bot/group/{groupId}/member/{userId}
+        Returns the user's displayName and pictureUrl.
+        """
+        import aiohttp
+        url = LINE_GROUP_MEMBER_PROFILE_URL_FMT.format(group_id=group_id, user_id=user_id)
+        timeout = aiohttp.ClientTimeout(total=10.0)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+                async with session.get(url, headers=self._headers) as resp:
+                    if resp.status >= 400:
+                        return None
+                    data = await resp.json()
+                    return data if data else None
         except Exception:
             return None
 
