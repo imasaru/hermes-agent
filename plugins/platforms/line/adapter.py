@@ -123,6 +123,7 @@ from gateway.platforms.base import (
     cache_video_from_bytes,
 )
 from gateway.config import Platform
+from gateway.platforms.helpers import compile_mention_patterns
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +303,90 @@ def split_for_line(text: str, max_chars: int = LINE_SAFE_BUBBLE_CHARS) -> List[s
         else:
             chunks.append(remaining[: max_chars - 1] + "…")
     return chunks
+
+
+# ---------------------------------------------------------------------------
+# Thinking/reasoning block stripping (robust final-response cleaning for LINE)
+# Ported/adapted from agent/agent_runtime_helpers.py:strip_think_blocks so the
+# adapter can guarantee clean visible text even when the gateway passes raw
+# agent output containing <think> / <reasoning> blocks (interim or final).
+# This makes the slow-LLM postback cache path robust to gateway response format.
+# ---------------------------------------------------------------------------
+
+_REASONING_TAG_NAMES = ("think", "thinking", "reasoning", "REASONING_SCRATCHPAD", "thought")
+_TOOL_CALL_TAG_NAMES = ("tool_call", "tool_calls", "tool_result", "function_call", "function_calls")
+
+_REASONING_BLOCK_PATTERNS = tuple(
+    re.compile(rf"<{name}>.*?</{name}>", re.DOTALL | re.IGNORECASE)
+    for name in _REASONING_TAG_NAMES
+)
+
+_TOOL_CALL_BLOCK_PATTERNS = tuple(
+    re.compile(rf"<{name}\b[^>]*>.*?</{name}>", re.DOTALL | re.IGNORECASE)
+    for name in _TOOL_CALL_TAG_NAMES
+)
+
+_NAMED_FUNCTION_BLOCK_PATTERN = re.compile(
+    r'(?:(?<=^)|(?<=[\\n\\r.!?:]))[ \\t]*'
+    r'<function\b[^>]*\bname\s*=[^>]*>'
+    r'(?:(?:(?!</function>).)*)</function>',
+    re.DOTALL | re.IGNORECASE,
+)
+
+_UNTERMINATED_REASONING_BLOCK_PATTERN = re.compile(
+    rf'(?:^|\n)[ \t]*<(?:{"|".join(_REASONING_TAG_NAMES)})\b[^>]*>.*$',
+    re.DOTALL | re.IGNORECASE,
+)
+
+_ORPHAN_REASONING_TAG_PATTERN = re.compile(
+    rf'</?(?:{"|".join(_REASONING_TAG_NAMES)})>\s*',
+    re.IGNORECASE,
+)
+
+_STRAY_TOOL_CALL_CLOSER_PATTERN = re.compile(
+    rf'</(?:{"|".join(_TOOL_CALL_TAG_NAMES)}|function)>\s*',
+    re.IGNORECASE,
+)
+
+
+def strip_think_blocks(text: str) -> str:
+    """Remove reasoning/thinking blocks (and some tool XML) returning only visible text.
+
+    Standalone version for the LINE adapter (no agent dep). See the full
+    docstring and rationale in agent_runtime_helpers.py.
+    """
+    if not text:
+        return text
+    if not isinstance(text, str):
+        if isinstance(text, list):
+            _parts: list[str] = []
+            for _part in text:
+                if isinstance(_part, str):
+                    _parts.append(_part)
+                elif isinstance(_part, dict):
+                    _parts.append(str(_part.get("text") or _part.get("content") or ""))
+            text = "".join(_parts)
+        elif isinstance(text, dict):
+            text = str(text.get("text") or text.get("content") or "")
+        else:
+            text = str(text)
+        if not text:
+            return ""
+    # 1. Closed tag pairs
+    for _pattern in _REASONING_BLOCK_PATTERNS:
+        text = _pattern.sub("", text)
+    # 1b. Tool-call XML blocks
+    for _pattern in _TOOL_CALL_BLOCK_PATTERNS:
+        text = _pattern.sub("", text)
+    # 1c. <function name=...>
+    text = _NAMED_FUNCTION_BLOCK_PATTERN.sub("", text)
+    # 2. Unterminated open reasoning block at boundary
+    text = _UNTERMINATED_REASONING_BLOCK_PATTERN.sub("", text)
+    # 3. Orphan tags
+    text = _ORPHAN_REASONING_TAG_PATTERN.sub("", text)
+    # 3b. Stray tool closers
+    text = _STRAY_TOOL_CALL_CLOSER_PATTERN.sub("", text)
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -754,6 +839,14 @@ class LineAdapter(BasePlatformAdapter):
 
         extra = getattr(config, "extra", {}) or {}
 
+        # Force shared (group) sessions for LINE: the entire chat history in the
+        # LINE conversation *is* the session. Per-user isolation would fragment
+        # context across members of a group/room (and cause loss on idle evict).
+        # Complements the hard enforcement inside session.build_session_key.
+        # Also see group_sessions_per_user: false in profile config.
+        extra["group_sessions_per_user"] = False
+        extra["thread_sessions_per_user"] = False
+
         # Credentials
         self.channel_access_token = (
             _get_scoped_secret("LINE_CHANNEL_ACCESS_TOKEN")
@@ -846,6 +939,115 @@ class LineAdapter(BasePlatformAdapter):
         # Pending-button slot per chat — ensures one outstanding postback
         # button per chat at a time. Postback cache request_id keyed by chat_id.
         self._pending_buttons: Dict[str, str] = {}
+
+        # Group addressing / mention gating state (hybrid model)
+        self._group_last_addressed: Dict[str, float] = {}
+        self._group_continuation_seconds = float(
+            os.getenv("LINE_GROUP_CONTINUATION_SECONDS", "3600")
+        )
+        self._mention_patterns: List[re.Pattern] = []
+        self._names_bridged: Set[str] = {}  # for future bridged attribution if needed
+
+        # Compile mention/keyword patterns now
+        self._mention_patterns = self._compile_mention_patterns()
+
+    # ------------------------------------------------------------------
+    # Mention / response gating helpers (native LINE @mentions + keywords)
+    # ------------------------------------------------------------------
+
+    def _compile_mention_patterns(self) -> List[re.Pattern]:
+        """Load LINE_MENTION_KEYWORDS / LINE_GROUP_KEYWORD / config for wake words."""
+        raw = os.getenv("LINE_MENTION_KEYWORDS") or os.getenv("LINE_GROUP_KEYWORD") or ""
+        extra = getattr(getattr(self, "config", None), "extra", {}) or {}
+        if not raw:
+            raw = extra.get("mention_keywords") or extra.get("group_keyword") or ""
+        if isinstance(raw, (list, tuple)):
+            raw = ",".join(str(x) for x in raw if x)
+        try:
+            return compile_mention_patterns(
+                raw,
+                log_prefix="LINE",
+                platform_label="line",
+                logger_=logger,
+            )
+        except Exception as exc:
+            logger.warning("LINE: mention pattern compile failed: %s", exc)
+            # fallback: treat as literal keywords
+            if not raw:
+                return []
+            parts = [p.strip() for p in str(raw).replace(",", "\n").splitlines() if p.strip()]
+            return [re.compile(re.escape(p), re.IGNORECASE) for p in parts if p]
+
+    def _message_mentions_bot(self, msg: Dict[str, Any], text: str = "") -> bool:
+        """Detect native @mention of this bot from LINE webhook struct.
+
+        Prefers structured `message.mention.mentionees[].(isSelf|userId)`.
+        Falls back to bot userId substring in text (per task spec).
+        """
+        if not isinstance(msg, dict):
+            msg = {}
+        mention = msg.get("mention") or {}
+        mentionees = mention.get("mentionees") or []
+        for m in mentionees:
+            if isinstance(m, dict):
+                if m.get("isSelf") is True:
+                    return True
+                uid = str(m.get("userId") or "").strip()
+                if self._bot_user_id and uid and uid == self._bot_user_id:
+                    return True
+        # Fallback per task
+        if self._bot_user_id and self._bot_user_id in (text or ""):
+            return True
+        return False
+
+    def _message_matches_mention_patterns(self, text: str) -> bool:
+        if not text or not self._mention_patterns:
+            return False
+        return any(p.search(text) for p in self._mention_patterns)
+
+    def _is_addressed(self, event_or_msg: Dict[str, Any], chat_id: str = "") -> bool:
+        """True if this message should trigger a full response (mention or keyword or quote)."""
+        msg = event_or_msg.get("message") or event_or_msg if isinstance(event_or_msg, dict) else {}
+        text = (msg.get("text") if isinstance(msg, dict) else "") or ""
+        if self._message_mentions_bot(msg, text):
+            return True
+        if self._message_matches_mention_patterns(text):
+            return True
+        # Quote-to-bot support (basic)
+        qid = self._walk_qid(msg)
+        if qid and hasattr(self, "_last_bot_message_id") and qid == getattr(self, "_last_bot_message_id", None):
+            return True
+        return False
+
+    def _is_in_continuation_window(self, chat_id: str) -> bool:
+        if not chat_id:
+            return False
+        last = self._group_last_addressed.get(chat_id, 0.0)
+        return (time.time() - last) < self._group_continuation_seconds
+
+    def _mark_chat_addressed(self, chat_id: str) -> None:
+        if chat_id:
+            self._group_last_addressed[chat_id] = time.time()
+
+    # Simple quote walker for future-proofing
+    def _walk_qid(self, msg: Dict[str, Any], depth: int = 2) -> Optional[str]:
+        """Depth-limited walk for quotedMessageId in nested structures."""
+        cur = msg or {}
+        for _ in range(depth):
+            if not isinstance(cur, dict):
+                break
+            qid = cur.get("quotedMessageId")
+            if qid:
+                return str(qid)
+            q = cur.get("quotedMessage") or cur.get("reply") or {}
+            if isinstance(q, dict):
+                qid = q.get("messageId") or q.get("id")
+                if qid:
+                    return str(qid)
+                cur = q.get("quotedMessage") or q
+            else:
+                break
+        return None
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -1063,9 +1265,25 @@ class LineAdapter(BasePlatformAdapter):
         msg_type = msg.get("type", "")
         message_id = msg.get("id", "")
         reply_token = event.get("replyToken", "")
+        mark_as_read_token = event.get("markAsReadToken", "")
         source = event.get("source") or {}
         chat_id, chat_type = _resolve_chat(source)
         user_id = source.get("userId", "") or chat_id
+
+        # Group mention / keyword / continuation gating (native @mention + LINE_*_KEYWORD)
+        if chat_type == "group":
+            addressed = self._is_addressed(event, chat_id)
+            if addressed:
+                self._mark_chat_addressed(chat_id)
+            elif self._is_in_continuation_window(chat_id):
+                addressed = True
+            else:
+                logger.debug("LINE: skipping non-addressed group message (no mention/keyword/continuation) chat=%s", chat_id)
+                return
+
+        # Best-effort read receipt — clear LINE's unread indicator immediately.
+        if mark_as_read_token and self._client:
+            asyncio.create_task(self._client.mark_read(mark_as_read_token))
 
         # Stash the reply token for outbound use.
         if chat_id and reply_token:
@@ -1114,6 +1332,9 @@ class LineAdapter(BasePlatformAdapter):
             chat_name=chat_id,
         )
 
+        # gating metadata for gateway
+        is_mentioned = self._message_mentions_bot(msg, text) if chat_type == "group" else True
+        kw_match = self._message_matches_mention_patterns(text) if chat_type == "group" else False
         event_obj = MessageEvent(
             text=text,
             message_type=_LINE_MESSAGE_TYPES.get(msg_type, MessageType.TEXT),
@@ -1122,6 +1343,7 @@ class LineAdapter(BasePlatformAdapter):
             message_id=message_id,
             media_urls=media_urls,
             media_types=media_types,
+            metadata={"is_mentioned": is_mentioned, "keyword_matched": kw_match, "line_group_addressed": True},
         )
 
         await self.handle_message(event_obj)
@@ -1150,8 +1372,11 @@ class LineAdapter(BasePlatformAdapter):
             return
 
         if entry.state is State.READY:
-            payload = entry.payload or ""
-            chunks = split_for_line(strip_markdown_preserving_urls(str(payload)))
+            raw_payload = str(entry.payload or "")
+            # Ensure clean final (strip any reasoning blocks that may have
+            # been in the cached agent output, then MD for LINE rendering).
+            visible = strip_think_blocks(raw_payload)
+            chunks = split_for_line(strip_markdown_preserving_urls(visible))
             messages = [_text_message(c) for c in chunks][:LINE_MAX_MESSAGES_PER_CALL]
             try:
                 await self._client.reply(reply_token, messages)
@@ -1245,9 +1470,18 @@ class LineAdapter(BasePlatformAdapter):
 
         # If the chat has a PENDING postback button outstanding, route the
         # response into the cache for the user to fetch via tap.
+        # Only the *final* (non-interim) response should populate the cache;
+        # interim reasoning/thinking blocks (marked _interim_send) are ignored
+        # here so they do not overwrite the slot for the real answer.
         pending_rid = self._pending_buttons.get(chat_id)
         if pending_rid:
-            self._cache.set_ready(pending_rid, content)
+            if (metadata or {}).get("_interim_send"):
+                # Swallow interim; final send will hit the still-PENDING state
+                # and populate. This fixes the "slow button shows reasoning"
+                # case where first post-threshold send was an intermediary block.
+                return SendResult(success=True, message_id=pending_rid)
+            cleaned = strip_think_blocks(content)
+            self._cache.set_ready(pending_rid, cleaned)
             return SendResult(success=True, message_id=pending_rid)
 
         return await self._send_text_chunks(chat_id, content, force_push=False)

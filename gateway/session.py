@@ -97,6 +97,20 @@ from .whatsapp_identity import (
 from utils import atomic_replace
 from agent.turn_context import extract_api_content_sidecar
 
+
+def _is_line_platform(p: Any) -> bool:
+    """Return True if this is the LINE platform.
+
+    LINE sessions are treated as eternal (mode="none"): the LINE chat
+    history *is* the session. Long gaps between messages are normal and
+    should never trigger idle/daily reset or eviction of context.
+    """
+    if p is None:
+        return False
+    val = getattr(p, "value", p)
+    return str(val).lower() == "line"
+
+
 # Session keys/ids flow into filesystem paths downstream (e.g.
 # ``sessions_dir / f"{session_id}.json"`` in hermes_state, request-dump
 # filenames in agent_runtime_helpers). Any value that could escape the
@@ -1203,6 +1217,14 @@ def build_session_key(
     # via thread_sessions_per_user, or when there is no thread (regular group).
     isolate_user = group_sessions_per_user
     if effective_thread_id and not thread_sessions_per_user:
+        isolate_user = False
+
+    # LINE: the LINE chat history *is* the session. Long gaps (days/weeks) are
+    # normal for LINE users. Always share one session per chat_id (group/room
+    # or DM) regardless of group_sessions_per_user / thread flag or participant
+    # id. This prevents per-user fragmentation and context loss on idle/agent
+    # cache evict. Matches the eternal (mode="none") treatment elsewhere.
+    if _is_line_platform(getattr(source, "platform", None)):
         isolate_user = False
 
     if isolate_user and participant_id:
@@ -2418,6 +2440,9 @@ class SessionStore:
             )
             return False
 
+        if _is_line_platform(entry.platform):
+            return False
+
         policy = self.config.get_reset_policy(
             platform=entry.platform,
             session_type=entry.chat_type,
@@ -2468,6 +2493,8 @@ class SessionStore:
         sweep falls back to reaping the agent rather than pinning it).
         """
         try:
+            if _is_line_platform(entry.platform):
+                return False
             policy = self.config.get_reset_policy(
                 platform=entry.platform,
                 session_type=entry.chat_type,
@@ -2519,14 +2546,17 @@ class SessionStore:
             )
             return None
 
+        if _is_line_platform(source.platform):
+            return None
+
         policy = self.config.get_reset_policy(
             platform=source.platform,
             session_type=source.chat_type
         )
-        
+
         if policy.mode == "none":
             return None
-        
+
         now = _now()
         
         if policy.mode in {"idle", "both"}:
