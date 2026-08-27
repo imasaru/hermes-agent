@@ -137,6 +137,9 @@ LINE_MARK_AS_READ_URL = "https://api.line.me/v2/bot/chat/markAsRead"
 LINE_CONTENT_URL_FMT = "https://api-data.line.me/v2/bot/message/{message_id}/content"
 LINE_BOT_INFO_URL = "https://api.line.me/v2/bot/info"
 LINE_GROUP_MEMBER_PROFILE_URL_FMT = "https://api.line.me/v2/bot/group/{group_id}/member/{user_id}"
+LINE_ROOM_MEMBER_PROFILE_URL_FMT = "https://api.line.me/v2/bot/room/{room_id}/member/{user_id}"
+LINE_GROUP_PROFILE_URL = "https://api.line.me/v2/bot/group/{group_id}"
+LINE_ROOM_PROFILE_URL = "https://api.line.me/v2/bot/room/{room_id}"
 
 # LINE Messaging API hard limits
 LINE_PER_BUBBLE_CHARS = 5000  # Hard limit per text message object
@@ -327,7 +330,7 @@ _TOOL_CALL_BLOCK_PATTERNS = tuple(
 )
 
 _NAMED_FUNCTION_BLOCK_PATTERN = re.compile(
-    r'(?:(?<=^)|(?<=[\\n\\r.!?:]))[ \\t]*'
+    r'(?:(?<=^)|(?<=[\n\\r.!?:]))[ \\t]*'
     r'<function\b[^>]*\bname\s*=[^>]*>'
     r'(?:(?:(?!</function>).)*)</function>',
     re.DOTALL | re.IGNORECASE,
@@ -719,6 +722,83 @@ class _LineClient:
         except Exception:
             return None
 
+    async def get_user_profile(self, user_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch a user's personal profile via LINE API.
+
+        LINE API: GET /v2/bot/profile/{userId}
+        Returns displayName, displayNamePriorityOrder, and pictureUrl.
+        May return empty for users who haven't friended the bot.
+        """
+        import aiohttp
+        url = f"https://api.line.me/v2/bot/profile/{user_id}"
+        timeout = aiohttp.ClientTimeout(total=10.0)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+                async with session.get(url, headers=self._headers) as resp:
+                    if resp.status >= 400:
+                        return None
+                    data = await resp.json()
+                    return data if data else None
+        except Exception:
+            return None
+
+    async def get_room_member_profile(self, room_id: str, user_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch a user's profile in a LINE room.
+
+        LINE API: GET /v2/bot/room/{roomId}/member/{userId}
+        Returns displayName and pictureUrl.
+        """
+        import aiohttp
+        url = LINE_ROOM_MEMBER_PROFILE_URL_FMT.format(room_id=room_id, user_id=user_id)
+        timeout = aiohttp.ClientTimeout(total=10.0)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+                async with session.get(url, headers=self._headers) as resp:
+                    if resp.status >= 400:
+                        return None
+                    data = await resp.json()
+                    return data if data else None
+        except Exception:
+            return None
+
+    async def get_group_profile(self, group_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch a LINE group's profile (name, icon, etc.).
+
+        LINE API: GET /v2/bot/group/{groupId}/profile
+        Returns group's name, iconUrl, and other metadata.
+        """
+        import aiohttp
+        url = LINE_GROUP_PROFILE_URL.format(group_id=group_id)
+        timeout = aiohttp.ClientTimeout(total=10.0)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+                async with session.get(url, headers=self._headers) as resp:
+                    if resp.status >= 400:
+                        return None
+                    data = await resp.json()
+                    return data if data else None
+        except Exception:
+            return None
+
+    async def get_room_profile(self, room_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch a LINE room's profile (name, icon, etc.).
+
+        LINE API: GET /v2/bot/room/{roomId}/profile
+        Returns room's name, iconUrl, and other metadata.
+        """
+        import aiohttp
+        url = LINE_ROOM_PROFILE_URL.format(room_id=room_id)
+        timeout = aiohttp.ClientTimeout(total=10.0)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+                async with session.get(url, headers=self._headers) as resp:
+                    if resp.status >= 400:
+                        return None
+                    data = await resp.json()
+                    return data if data else None
+        except Exception:
+            return None
+
 
 # ---------------------------------------------------------------------------
 # Message builders
@@ -930,6 +1010,7 @@ class LineAdapter(BasePlatformAdapter):
         self._dedup = _MessageDeduplicator()
         self._bot_user_id: Optional[str] = None
         self._lock_key: Optional[str] = None
+        self._pending_mark_reads: Dict[str, str] = {}  # chat_id → markAsReadToken (only when triggered to respond)
 
         # Media state
         self._media_tokens: Dict[str, Tuple[str, float]] = {}  # token → (path, expiry)
@@ -946,7 +1027,16 @@ class LineAdapter(BasePlatformAdapter):
             os.getenv("LINE_GROUP_CONTINUATION_SECONDS", "3600")
         )
         self._mention_patterns: List[re.Pattern] = []
-        self._names_bridged: Set[str] = {}  # for future bridged attribution if needed
+        self._names_bridged: Set[str] = set()  # for future bridged attribution if needed (FIXED: was dict literal ={} in 9b0aceaeb5 causing 'dict' has no 'add')
+
+        # Best-effort display-name cache for group attribution (persisted across restarts)
+        self._display_names: Dict[str, str] = {}  # userId → displayName
+
+        # Group/room name cache — avoids repeated LINE API calls (persisted)
+        self._chat_names: Dict[str, str] = {}  # chat_id → group/room name
+
+        # Load any previously persisted name caches (profile-specific, best-effort)
+        self._load_line_contacts()
 
         # Compile mention/keyword patterns now
         self._mention_patterns = self._compile_mention_patterns()
@@ -1029,6 +1119,214 @@ class LineAdapter(BasePlatformAdapter):
         if chat_id:
             self._group_last_addressed[chat_id] = time.time()
 
+    # ------------------------------------------------------------------
+    # Chat name resolution for group/room sessions
+    # ------------------------------------------------------------------
+
+    async def _resolve_chat_name(self, chat_id: str, chat_type: str) -> str:
+        """Resolve the human-readable group/room name from LINE API.
+
+        Returns the cached name if available, otherwise fetches from LINE
+        and caches the result. Falls back to the raw chat_id on failure.
+        """
+        # Return cached name if available
+        if chat_id in self._chat_names:
+            return self._chat_names[chat_id]
+
+        # DMs don't have a group/room name
+        if chat_type == "dm":
+            return ""
+
+        # Fetch from LINE API
+        if not self._client:
+            self._chat_names[chat_id] = chat_id
+            self._save_line_contacts()
+            return chat_id
+
+        try:
+            if chat_type == "group":
+                profile = await self._client.get_group_profile(chat_id)
+            elif chat_type == "room":
+                profile = await self._client.get_room_profile(chat_id)
+            else:
+                self._chat_names[chat_id] = chat_id
+                return chat_id
+
+            if profile and profile.get("name"):
+                name = profile["name"]
+                self._chat_names[chat_id] = name
+                self._save_line_contacts()
+                return name
+        except Exception as exc:
+            logger.debug("LINE: failed to resolve chat name for %s: %s", chat_id, exc)
+
+        # Fallback: use the raw chat_id
+        self._chat_names[chat_id] = chat_id
+        self._save_line_contacts()
+        return chat_id
+
+    # ------------------------------------------------------------------
+    # Display name resolution for group attribution
+    # ------------------------------------------------------------------
+
+    async def _ensure_display_name(self, user_id: str, chat_id: Optional[str] = None) -> None:
+        """Best-effort background fetch of a user's display name.
+
+        Tries the group/room member endpoint first (works even when the user
+        hasn't friended the bot), then falls back to the personal profile
+        endpoint.  Results are cached in-memory in ``self._display_names``.
+        """
+        if user_id in self._display_names:
+            return  # already cached
+
+        if chat_id and chat_id.startswith(("C", "R")) and self._client:
+            # Group or room — try member endpoint first
+            endpoint_type = "group" if chat_id.startswith("C") else "room"
+            try:
+                if endpoint_type == "group":
+                    profile = await self._client.get_group_member_profile(chat_id, user_id)
+                else:
+                    profile = await self._client.get_room_member_profile(chat_id, user_id)
+                if profile and profile.get("displayName"):
+                    self._display_names[user_id] = profile["displayName"]
+                    self._save_line_contacts()
+                    return
+            except Exception:
+                pass
+
+        # Fallback to personal endpoint (DM or group where member endpoint
+        # also failed / isn't available)
+        if user_id not in self._display_names and self._client:
+            try:
+                profile = await self._client.get_user_profile(user_id)
+                if profile and profile.get("displayName"):
+                    self._display_names[user_id] = profile["displayName"]
+                    self._save_line_contacts()
+            except Exception:
+                pass
+
+    def _get_display_name(self, user_id: str) -> str:
+        """Return the cached display name for a user, or empty string."""
+        return self._display_names.get(user_id, "")
+
+    def _get_bridged_display_name(self, user_id: str) -> str:
+        """Return label for attribution with one-time bridge.
+
+        First time we have a friendly name for this user in this process run
+        → ``"Name|Uxxxx"``.  Subsequent messages → ``"Name"``.  No name yet
+        → ``"Uxxxx"`` (raw ID fallback).  Never produces ``[Uxxxx|Uxxxx]``.
+        """
+        if not user_id:
+            return "unknown"
+        display = self._get_display_name(user_id)
+        has_friendly = bool(display and display != user_id)
+        if has_friendly and user_id not in self._names_bridged:
+            self._names_bridged.add(user_id)
+            return f"{display}|{user_id}"  # first time: "Name|Uxxxx"
+        return display if has_friendly else user_id  # subsequent: "Name" or fallback "Uxxxx"
+
+    # ------------------------------------------------------------------
+    # Persistent LINE contacts / name cache (profile-specific)
+    # ------------------------------------------------------------------
+
+    def _get_line_contacts_path(self) -> "Path":
+        """Return the path for the persisted LINE name cache.
+
+        Configurable via extra:
+            line_contacts_file: "/absolute/path/contacts.json"
+            or line_contacts_file: "relative/to/profile/cache/line_contacts.json"
+
+        Default: <hermes_home>/cache/line_contacts.json
+        """
+        extra = getattr(getattr(self, "config", None), "extra", {}) or {}
+        configured = (
+            extra.get("line_contacts_file")
+            or extra.get("line_contacts_cache")
+            or extra.get("contacts_file")
+            or extra.get("contacts_cache")
+        )
+        if configured:
+            p = Path(configured)
+            if not p.is_absolute():
+                try:
+                    from hermes_constants import get_hermes_home
+                    p = Path(get_hermes_home()) / p
+                except Exception:
+                    p = Path.home() / ".hermes" / p
+            return p
+
+        try:
+            from hermes_constants import get_hermes_home
+            base = Path(get_hermes_home())
+        except Exception:
+            base = Path.home() / ".hermes"
+        return base / "cache" / "line_contacts.json"
+
+    def _load_line_contacts(self) -> None:
+        """Load previously persisted display_names and chat_names.
+
+        Failures are non-fatal; we simply start with empty caches and will
+        re-fetch from the LINE API as needed.
+        """
+        path = self._get_line_contacts_path()
+        try:
+            if not path.exists():
+                return
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return
+            dn = data.get("display_names") or {}
+            cn = data.get("chat_names") or {}
+            if isinstance(dn, dict):
+                for k, v in dn.items():
+                    self._display_names[str(k)] = str(v)
+            if isinstance(cn, dict):
+                for k, v in cn.items():
+                    self._chat_names[str(k)] = str(v)
+            logger.debug(
+                "LINE: loaded %d display names + %d chat names from %s",
+                len(self._display_names), len(self._chat_names), path
+            )
+        except Exception as exc:
+            logger.debug("LINE: failed to load contacts cache %s: %s", path, exc)
+
+    def _save_line_contacts(self) -> None:
+        """Persist the current name caches (atomic write).
+
+        Defensive behavior:
+        - If both caches are empty in memory, do nothing (avoid clobbering a good file).
+        - Otherwise, merge any existing on-disk data first (we never lose previously known names).
+        """
+        if not self._display_names and not self._chat_names:
+            return
+
+        path = self._get_line_contacts_path()
+        try:
+            # Merge on-disk first so we never lose older entries
+            existing = {}
+            if path.exists():
+                try:
+                    existing = json.loads(path.read_text(encoding="utf-8")) or {}
+                except Exception:
+                    existing = {}
+
+            merged_dn = {**(existing.get("display_names") or {}), **self._display_names}
+            merged_cn = {**(existing.get("chat_names") or {}), **self._chat_names}
+
+            if not merged_dn and not merged_cn:
+                return  # nothing to persist
+
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "version": 1,
+                "display_names": merged_dn,
+                "chat_names": merged_cn,
+            }
+            from utils import atomic_json_write
+            atomic_json_write(path, payload)
+        except Exception as exc:
+            logger.debug("LINE: failed to save contacts cache: %s", exc)
+
     # Simple quote walker for future-proofing
     def _walk_qid(self, msg: Dict[str, Any], depth: int = 2) -> Optional[str]:
         """Depth-limited walk for quotedMessageId in nested structures."""
@@ -1048,6 +1346,63 @@ class LineAdapter(BasePlatformAdapter):
             else:
                 break
         return None
+
+    # ------------------------------------------------------------------
+    # Group message observation (observe-then-decide)
+    # ------------------------------------------------------------------
+
+    def _observe_group_message(
+        self, chat_id: str, user_id: str, text: str,
+        *,
+        message_id: Optional[str] = None,
+    ) -> None:
+        """Write a group message into the session transcript without triggering the agent.
+
+        This allows the model to see the full group conversation when it is
+        eventually invoked via @bot.  Messages are stored with ``role: "user"``
+        in the format ``[nickname|user_id]\n<content>`` so the model
+        can distinguish participants and their user ids.
+
+        Uses bridged display names (e.g. ``"Alice|Uxxxx"`` on first message,
+        ``"Alice"`` thereafter) for clean attribution.  Kicks off a best-effort
+        background fetch of the display name via LINE's group member profile API.
+        """
+        store = getattr(self, "_session_store", None)
+        if not store:
+            return
+        try:
+            # Kick off background display name fetch (fire-and-forget)
+            if self._client:
+                asyncio.create_task(self._ensure_display_name(user_id, chat_id))
+            # Resolve bridged display name for attribution
+            display_name = self._get_bridged_display_name(user_id)
+            attributed = f"[{display_name}]\n{text}"
+            # Build source object for session store
+            from gateway.session import SessionSource
+            from gateway.config import Platform
+            source = SessionSource(
+                platform=Platform("line"),
+                chat_id=chat_id,
+                chat_type="group",
+                user_id=user_id,
+                user_name=display_name,
+                chat_name=chat_id,
+            )
+            entry: dict = {
+                "role": "user",
+                "content": attributed,
+                "timestamp": __import__("datetime").datetime.now(tz=__import__("datetime").timezone.utc).isoformat(),
+                "observed": True,
+            }
+            if message_id:
+                entry["message_id"] = message_id
+            session_entry = store.get_or_create_session(source)
+            store.append_to_transcript(
+                session_entry.session_id,
+                entry,
+            )
+        except Exception as exc:
+            logger.warning("LINE: Failed to observe group message: %s", exc)
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -1186,6 +1541,13 @@ class LineAdapter(BasePlatformAdapter):
                 pass
             self._lock_key = None
 
+        # Best-effort flush of name caches so the next gateway start
+        # has fresh data without waiting for new LINE API calls.
+        try:
+            self._save_line_contacts()
+        except Exception:
+            pass
+
     # ------------------------------------------------------------------
     # Webhook handlers
     # ------------------------------------------------------------------
@@ -1265,25 +1627,27 @@ class LineAdapter(BasePlatformAdapter):
         msg_type = msg.get("type", "")
         message_id = msg.get("id", "")
         reply_token = event.get("replyToken", "")
-        mark_as_read_token = event.get("markAsReadToken", "")
+        # markAsReadToken lives inside the "message" object per LINE docs.
+        mark_as_read_token = msg.get("markAsReadToken") or event.get("markAsReadToken") or ""
         source = event.get("source") or {}
         chat_id, chat_type = _resolve_chat(source)
         user_id = source.get("userId", "") or chat_id
 
         # Group mention / keyword / continuation gating (native @mention + LINE_*_KEYWORD)
         if chat_type == "group":
+            # Extract text for observation before gating (so content isn't lost).
+            msg_text = msg.get("text", "") or ""
             addressed = self._is_addressed(event, chat_id)
             if addressed:
                 self._mark_chat_addressed(chat_id)
             elif self._is_in_continuation_window(chat_id):
                 addressed = True
             else:
+                # Observe the message before dropping it so the bot
+                # retains full conversation context for future @mentions.
+                self._observe_group_message(chat_id, user_id, msg_text, message_id=message_id)
                 logger.debug("LINE: skipping non-addressed group message (no mention/keyword/continuation) chat=%s", chat_id)
                 return
-
-        # Best-effort read receipt — clear LINE's unread indicator immediately.
-        if mark_as_read_token and self._client:
-            asyncio.create_task(self._client.mark_read(mark_as_read_token))
 
         # Stash the reply token for outbound use.
         if chat_id and reply_token:
@@ -1291,6 +1655,14 @@ class LineAdapter(BasePlatformAdapter):
                 reply_token,
                 time.time() + LINE_REPLY_TOKEN_TTL_SECONDS,
             )
+
+        # Stash and promptly mark read, but *only* for messages that trigger a response.
+        # Non-addressed group messages are observed into the transcript for future context
+        # but do not cause a read receipt (per original design requirement).
+        if mark_as_read_token and chat_id:
+            self._pending_mark_reads[chat_id] = mark_as_read_token
+            if self._client:
+                asyncio.create_task(self._client.mark_read(mark_as_read_token))
 
         # Handle media inbound — fetch the binary, cache it, and surface a
         # vision-tool-friendly local path on the MessageEvent.
@@ -1324,13 +1696,68 @@ class LineAdapter(BasePlatformAdapter):
         if chat_type == "dm" and self._client:
             asyncio.create_task(self._client.loading(chat_id))
 
+        # Resolve display name for attribution (background fetch already kicked off
+        # in observe path; for DMs or first-time group users we try a quick fetch).
+        if self._client and user_id not in self._display_names:
+            asyncio.create_task(self._ensure_display_name(user_id, chat_id))
+        display_name = self._get_bridged_display_name(user_id)
+
+        # Resolve the human-readable group/room name for session naming.
+        chat_name = self._resolve_chat_name(chat_id, chat_type)
+        if asyncio.iscoroutine(chat_name):
+            chat_name = await chat_name
+
         source_obj = self.build_source(
             chat_id=chat_id,
             chat_type=chat_type,
             user_id=user_id,
-            user_name=user_id,
-            chat_name=chat_id,
+            user_name=display_name,
+            chat_name=chat_name or chat_id,
         )
+
+        # Prefix inbound user messages with the bridged display name for clarity
+        # in the session transcript. This now applies to DMs as well as groups
+        # and rooms (per user request for better visibility of who is speaking
+        # when looking at raw session history / context).
+        #
+        # Format (consistent with _observe_group_message for groups):
+        #   First sighting for a user: "[Name|Uxxxx]\n<message>"
+        #   Subsequent:                "[Name]\n<message>"
+        #
+        # The source.user_name already carries this (visible in gateway logs as
+        # "user=..."), but we also embed it directly in the message content so
+        # that the stored transcript / conversation history always makes it
+        # obvious who said what — especially useful for DMs where the session
+        # name alone can sometimes be ambiguous.
+        if display_name:
+            text = f"[{display_name}]\n{text}"
+
+        # Seed / migrate the session title with the chat name for LINE group/room
+        # sessions.  The auto-title generator skips when a title already exists,
+        # so this ensures the session is named after the LINE chat rather than the
+        # first message content.  For DMs the auto-title is fine (user name is in
+        # the session key), so we only seed for groups/rooms.
+        #
+        # Also handles existing sessions created before this fix: if the current
+        # display_name is a raw LINE group/room ID (G/C/U prefix), we resolve the
+        # real name and update it in-place.
+        if chat_name and chat_type in ("group", "room"):
+            store = getattr(self, "_session_store", None)
+            if store:
+                session_entry = store.get_or_create_session(source_obj)
+                current_title = session_entry.display_name or ""
+                # Check if the current title is a raw LINE ID (pre-fix sessions)
+                if current_title.startswith(("G", "C", "U")):
+                    # Migrate: update the display_name on the existing entry
+                    session_entry.display_name = chat_name
+                    store._save_entry(session_entry.session_key, lock_held=False)
+                    logger.info(
+                        "LINE: migrated session title for %s from %r to %r",
+                        session_entry.session_key, current_title, chat_name,
+                    )
+                else:
+                    # New session or already-named — set title if empty
+                    store.set_auto_title_if_empty(session_entry.session_id, chat_name)
 
         # gating metadata for gateway
         is_mentioned = self._message_mentions_bot(msg, text) if chat_type == "group" else True
@@ -1505,6 +1932,7 @@ class LineAdapter(BasePlatformAdapter):
         if used_reply and not force_push:
             try:
                 await self._client.reply(token, messages)
+                self._pending_mark_reads.pop(chat_id, None)
                 return SendResult(success=True, message_id=token)
             except Exception as exc:
                 logger.info("LINE: reply token rejected (%s); falling back to push", exc)
@@ -1512,6 +1940,7 @@ class LineAdapter(BasePlatformAdapter):
 
         try:
             await self._client.push(chat_id, messages)
+            self._pending_mark_reads.pop(chat_id, None)
             return SendResult(success=True, message_id=None)
         except Exception as exc:
             logger.error("LINE: push send failed: %s", exc)
@@ -1854,6 +2283,12 @@ class LineAdapter(BasePlatformAdapter):
             except Exception as exc:
                 logger.warning("LINE: push for follow-up batch failed: %s", exc)
                 return SendResult(success=False, error=str(exc))
+
+        # Consume any pending mark-read token for this chat (early fire on trigger already handled most cases).
+        # Fire here too for media paths and as a safety net.
+        token = self._pending_mark_reads.pop(chat_id, None)
+        if token and self._client:
+            asyncio.create_task(self._client.mark_read(token))
 
         return SendResult(success=True, message_id=None)
 
