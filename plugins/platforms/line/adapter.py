@@ -963,6 +963,13 @@ class LineAdapter(BasePlatformAdapter):
         self.allow_all = _truthy_env(
             "LINE_ALLOW_ALL_USERS", bool(extra.get("allow_all_users", False))
         )
+
+        # Soft gate: when True, always dispatch group messages to the LLM
+        # instead of gating on keyword/mention. The LLM receives
+        # `line_group_addressed: False` in metadata so it knows it wasn't
+        # directly addressed.  SOUL.md should guide silence on irrelevant
+        # messages.  When False (default), keeps current hard-gate behavior.
+        self._soft_gate = _truthy_env("LINE_SOFT_GATE")
         self.allowed_users = _csv_set(
             os.getenv("LINE_ALLOWED_USERS", "")
         ) | set(extra.get("allowed_users", []))
@@ -991,6 +998,32 @@ class LineAdapter(BasePlatformAdapter):
             os.getenv("LINE_BUTTON_LABEL")
             or extra.get("button_label", DEFAULT_BUTTON_LABEL)
         )
+
+        # Timezone for message timestamps (default: Asia/Tokyo / JST).
+        # Accepts IANA tz names (e.g. "America/New_York", "Europe/London")
+        # or fixed offsets like "UTC+9", "UTC-5".
+        self._tz_name = os.getenv("LINE_TIMEZONE", "Asia/Tokyo")
+        self._tz = None
+        try:
+            from zoneinfo import ZoneInfo
+            self._tz = ZoneInfo(self._tz_name)
+        except Exception:
+            # Fallback: parse fixed offsets like "UTC+9", "UTC-5"
+            m = re.match(r"UTC([+-])(\d{1,2})(?::(\d{2}))?", self._tz_name)
+            if m:
+                sign = 1 if m.group(1) == "+" else -1
+                hours = int(m.group(2))
+                mins = int(m.group(3) or "0")
+                from datetime import timedelta, timezone
+                self._tz = timezone(timedelta(hours=sign * hours, minutes=sign * mins))
+            else:
+                # Last resort: UTC
+                from datetime import timezone as _tz
+                self._tz = _tz.utc
+                logger.warning(
+                    "LINE: could not resolve timezone %r, falling back to UTC",
+                    self._tz_name,
+                )
         self.delivered_text = (
             os.getenv("LINE_DELIVERED_TEXT")
             or extra.get("delivered_text", DEFAULT_DELIVERED_TEXT)
@@ -1355,12 +1388,13 @@ class LineAdapter(BasePlatformAdapter):
         self, chat_id: str, user_id: str, text: str,
         *,
         message_id: Optional[str] = None,
+        timestamp: Optional[int] = None,
     ) -> None:
         """Write a group message into the session transcript without triggering the agent.
 
         This allows the model to see the full group conversation when it is
         eventually invoked via @bot.  Messages are stored with ``role: "user"``
-        in the format ``[nickname|user_id]\n<content>`` so the model
+        in the format ``[nickname|user_id]\\n<content>`` so the model
         can distinguish participants and their user ids.
 
         Uses bridged display names (e.g. ``"Alice|Uxxxx"`` on first message,
@@ -1376,7 +1410,19 @@ class LineAdapter(BasePlatformAdapter):
                 asyncio.create_task(self._ensure_display_name(user_id, chat_id))
             # Resolve bridged display name for attribution
             display_name = self._get_bridged_display_name(user_id)
-            attributed = f"[{display_name}]\n{text}"
+
+            # Format timestamp for attribution (LINE event timestamp: ms since epoch).
+            # Uses the configured timezone (default: Asia/Tokyo / JST).
+            _obs_ts = ""
+            if timestamp and self._tz:
+                try:
+                    from datetime import datetime
+                    _dt = datetime.fromtimestamp(timestamp / 1000, tz=self._tz)
+                    _obs_ts = _dt.strftime(" | %Y-%m-%d %H:%M:%S %Z")
+                except Exception:
+                    pass
+
+            attributed = f"[{display_name}{_obs_ts}]\n{text}"
             # Build source object for session store
             from gateway.session import SessionSource
             from gateway.config import Platform
@@ -1633,21 +1679,42 @@ class LineAdapter(BasePlatformAdapter):
         chat_id, chat_type = _resolve_chat(source)
         user_id = source.get("userId", "") or chat_id
 
+        # Extract and format timestamp from LINE event (milliseconds since epoch).
+        # Uses the configured timezone (default: Asia/Tokyo / JST).
+        _line_ts = event.get("timestamp")
+        _formatted_ts = ""
+        if _line_ts and self._tz:
+            try:
+                from datetime import datetime
+                _dt = datetime.fromtimestamp(_line_ts / 1000, tz=self._tz)
+                _formatted_ts = _dt.strftime("%Y-%m-%d %H:%M:%S %Z")
+            except Exception:
+                pass
+
         # Group mention / keyword / continuation gating (native @mention + LINE_*_KEYWORD)
+        # Default: always dispatch (DMs and soft-gate groups).
+        addressed = True
+
         if chat_type == "group":
             # Extract text for observation before gating (so content isn't lost).
             msg_text = msg.get("text", "") or ""
-            addressed = self._is_addressed(event, chat_id)
-            if addressed:
-                self._mark_chat_addressed(chat_id)
-            elif self._is_in_continuation_window(chat_id):
-                addressed = True
+            if self._soft_gate:
+                # Soft gate: always dispatch to LLM, let it decide.
+                # Pass `addressed=False` so LLM knows it wasn't directly addressed.
+                addressed = False
             else:
-                # Observe the message before dropping it so the bot
-                # retains full conversation context for future @mentions.
-                self._observe_group_message(chat_id, user_id, msg_text, message_id=message_id)
-                logger.debug("LINE: skipping non-addressed group message (no mention/keyword/continuation) chat=%s", chat_id)
-                return
+                # Hard gate: current behavior — only dispatch if addressed.
+                addressed = self._is_addressed(event, chat_id)
+                if addressed:
+                    self._mark_chat_addressed(chat_id)
+                elif self._is_in_continuation_window(chat_id):
+                    addressed = True
+                else:
+                    # Observe the message before dropping it so the bot
+                    # retains full conversation context for future @mentions.
+                    self._observe_group_message(chat_id, user_id, msg_text, message_id=message_id, timestamp=_line_ts)
+                    logger.debug("LINE: skipping non-addressed group message (no mention/keyword/continuation) chat=%s", chat_id)
+                    return
 
         # Stash the reply token for outbound use.
         if chat_id and reply_token:
@@ -1730,7 +1797,8 @@ class LineAdapter(BasePlatformAdapter):
         # obvious who said what — especially useful for DMs where the session
         # name alone can sometimes be ambiguous.
         if display_name:
-            text = f"[{display_name}]\n{text}"
+            ts_suffix = f" | {_formatted_ts}" if _formatted_ts else ""
+            text = f"[{display_name}{ts_suffix}]\n{text}"
 
         # Seed / migrate the session title with the chat name for LINE group/room
         # sessions.  The auto-title generator skips when a title already exists,
@@ -1770,7 +1838,7 @@ class LineAdapter(BasePlatformAdapter):
             message_id=message_id,
             media_urls=media_urls,
             media_types=media_types,
-            metadata={"is_mentioned": is_mentioned, "keyword_matched": kw_match, "line_group_addressed": True},
+            metadata={"is_mentioned": is_mentioned, "keyword_matched": kw_match, "line_group_addressed": addressed},
         )
 
         await self.handle_message(event_obj)
