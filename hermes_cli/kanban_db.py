@@ -2146,50 +2146,57 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     promoted = 0
-    with write_txn(conn):
-        todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
-            "FROM tasks WHERE status IN ('todo', 'blocked')"
-        ).fetchall()
-        for row in todo_rows:
-            task_id = row["id"]
-            cur_status = row["status"]
-            if cur_status == "blocked" and _has_sticky_block(conn, task_id):
-                # Explicit human-intervention block; only ``unblock_task`` may exit it.
-                continue
-            parents = conn.execute(
-                "SELECT t.status FROM tasks t "
-                "JOIN task_links l ON l.parent_id = t.id "
-                "WHERE l.child_id = ?", (task_id,),
+    # List always refreshes derived ready-state. Delegated children may run this
+    # idempotent pass; a read-only fenced connection skips it instead of dying.
+    try:
+        with write_txn(conn, allow_delegated=True):
+            todo_rows = conn.execute(
+                "SELECT id, status, consecutive_failures, max_retries "
+                "FROM tasks WHERE status IN ('todo', 'blocked')"
             ).fetchall()
-            if all(p["status"] in ("done", "archived") for p in parents):
-                resume_status = _resume_status_from_events(conn, task_id)
-                if cur_status == "blocked":
-                    # At the breaker limit, no auto-recovery (else block ->
-                    # recover -> respawn -> exhaust -> block forever). The
-                    # counter is preserved so it accumulates across cycles.
-                    failures = int(row["consecutive_failures"] or 0)
-                    task_limit = row["max_retries"]
-                    effective_limit = (
-                        int(task_limit) if task_limit is not None
-                        else int(failure_limit)
+            for row in todo_rows:
+                task_id = row["id"]
+                cur_status = row["status"]
+                if cur_status == "blocked" and _has_sticky_block(conn, task_id):
+                    # Explicit human-intervention block; only ``unblock_task`` may exit it.
+                    continue
+                parents = conn.execute(
+                    "SELECT t.status FROM tasks t "
+                    "JOIN task_links l ON l.parent_id = t.id "
+                    "WHERE l.child_id = ?", (task_id,),
+                ).fetchall()
+                if all(p["status"] in ("done", "archived") for p in parents):
+                    resume_status = _resume_status_from_events(conn, task_id)
+                    if cur_status == "blocked":
+                        # At the breaker limit, no auto-recovery (else block ->
+                        # recover -> respawn -> exhaust -> block forever). The
+                        # counter is preserved so it accumulates across cycles.
+                        failures = int(row["consecutive_failures"] or 0)
+                        task_limit = row["max_retries"]
+                        effective_limit = (
+                            int(task_limit) if task_limit is not None
+                            else int(failure_limit)
+                        )
+                        if failures >= effective_limit:
+                            continue
+                        conn.execute(
+                            "UPDATE tasks SET status = ? "
+                            "WHERE id = ? AND status = 'blocked'", (resume_status, task_id),
+                        )
+                    else:
+                        conn.execute(
+                            "UPDATE tasks SET status = ? WHERE id = ? AND status = 'todo'",
+                            (resume_status, task_id),
+                        )
+                    _append_event(
+                        conn, task_id, "promoted",
+                        {"status": resume_status} if resume_status != "ready" else None,
                     )
-                    if failures >= effective_limit:
-                        continue
-                    conn.execute(
-                        "UPDATE tasks SET status = ? "
-                        "WHERE id = ? AND status = 'blocked'", (resume_status, task_id),
-                    )
-                else:
-                    conn.execute(
-                        "UPDATE tasks SET status = ? WHERE id = ? AND status = 'todo'",
-                        (resume_status, task_id),
-                    )
-                _append_event(
-                    conn, task_id, "promoted",
-                    {"status": resume_status} if resume_status != "ready" else None,
-                )
-                promoted += 1
+                    promoted += 1
+    except sqlite3.OperationalError as exc:
+        if "readonly" not in str(exc).lower():
+            raise
+        return 0
     return promoted
 
 

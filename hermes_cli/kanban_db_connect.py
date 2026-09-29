@@ -954,7 +954,9 @@ def _backfill_legacy_inflight_runs(conn: sqlite3.Connection) -> None:
     write_txn serializes against concurrent dispatchers, and the per-row
     UPDATE uses ``current_run_id IS NULL`` as a CAS guard so a racing claim
     can't produce an orphaned row."""
-    with write_txn(conn):
+    # Idempotent schema backfill. A delegated child running `hermes kanban list`
+    # must be able to finish init; ordinary task mutations stay fail-closed.
+    with write_txn(conn, allow_delegated=True):
         inflight = conn.execute(
             "SELECT id, assignee, claim_lock, claim_expires, worker_pid, "
             "       max_runtime_seconds, last_heartbeat_at, started_at "
@@ -1188,7 +1190,9 @@ def _main_db_file(conn: sqlite3.Connection) -> Optional[str]:
 
 
 @contextlib.contextmanager
-def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
+def write_txn(
+    conn: sqlite3.Connection, *, allow_nested: bool = False, allow_delegated: bool = False,
+):
     """IMMEDIATE write transaction; a claim CAS inside is atomic — at most one
     concurrent writer succeeds.
 
@@ -1197,8 +1201,15 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
     ``add_comment``) opt in — helpers with post-commit side effects
     (``complete_task`` & co.) must never run under an open outer transaction,
     since those side effects would fire while the outer txn can still roll back.
+
+    ``allow_delegated`` skips the delegated-child guard for idempotent work a
+    child must run before it can read: schema backfill, ``recompute_ready``,
+    and crash reclaim. Task and board mutations keep the default fail-closed
+    check. A fenced board is opened read-only, so this flag does not by itself
+    make a read-only connection writable.
     """
-    _kb._assert_not_delegated_child_mutation(_main_db_file(conn))
+    if not allow_delegated:
+        _kb._assert_not_delegated_child_mutation(_main_db_file(conn))
     if getattr(conn, "in_transaction", False):
         if not allow_nested:
             raise RuntimeError(

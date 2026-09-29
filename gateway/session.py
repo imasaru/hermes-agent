@@ -647,6 +647,10 @@ def is_shared_multi_user_session(
     isolation rules in :func:`build_session_key`)."""
     if source.chat_type == "dm":
         return False
+    # LINE keeps one session per chat. A per-member key splits the group.
+    platform_name = getattr(source.platform, "value", source.platform)
+    if source.chat_id and str(platform_name).lower() == "line":
+        return True
     return not (thread_sessions_per_user if source.thread_id else group_sessions_per_user)
 
 
@@ -708,6 +712,11 @@ def build_session_key(
         # Threads are shared by default; per-user isolation only via thread_sessions_per_user or
         # outside a thread.
         isolate_user = group_sessions_per_user and not (thread_id and not thread_sessions_per_user)
+    # LINE: one session per chat_id. Per-participant keys fragment a group and
+    # drop context between members. DMs with no chat_id still fall back to the sender.
+    platform_name = getattr(source.platform, "value", source.platform)
+    if chat_id and str(platform_name).lower() == "line":
+        isolate_user = False
     # Duck-typed sources may lack user_id_alt: read the participant only when it matters.
     participant_id = _canonical_participant(source) if (isolate_user or not is_dm) else None
 

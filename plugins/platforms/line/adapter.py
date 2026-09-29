@@ -53,8 +53,10 @@ logger = logging.getLogger(__name__)
 LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
 LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
 LINE_LOADING_URL = "https://api.line.me/v2/bot/chat/loading/start"
+LINE_MARK_AS_READ_URL = "https://api.line.me/v2/bot/chat/markAsRead"
 LINE_CONTENT_URL_FMT = "https://api-data.line.me/v2/bot/message/{message_id}/content"
 LINE_BOT_INFO_URL = "https://api.line.me/v2/bot/info"
+LINE_GROUP_MEMBER_PROFILE_URL_FMT = "https://api.line.me/v2/bot/group/{group_id}/member/{user_id}"
 LINE_PER_BUBBLE_CHARS = 5000  # LINE hard limit
 LINE_SAFE_BUBBLE_CHARS = 4500  # conservative chunking limit
 LINE_MAX_MESSAGES_PER_CALL = 5
@@ -234,18 +236,21 @@ class _LineClient:
         import aiohttp
         return aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout), trust_env=gateway_trust_env())
 
-    async def _post_messages(self, url: str, label: str, payload: Dict[str, Any]) -> None:
+    async def _post_messages(self, url: str, label: str, payload: Dict[str, Any]) -> Optional[str]:
+        """POST a message payload. Returns the first ``sentMessages[].id`` when LINE sends one."""
         async with self._session(self._timeout) as session:
             async with session.post(url, headers=self._headers, json=payload) as resp:
                 if resp.status >= 400:
                     body = await resp.text()
                     raise RuntimeError(f"LINE {label} {resp.status}: {body[:200]}")
+                return await _first_sent_message_id(resp)
 
-    async def reply(self, reply_token: str, messages: List[Dict[str, Any]]) -> None:
-        await self._post_messages(LINE_REPLY_URL, "reply", {"replyToken": reply_token, "messages": messages})
+    async def reply(self, reply_token: str, messages: List[Dict[str, Any]]) -> Optional[str]:
+        return await self._post_messages(
+            LINE_REPLY_URL, "reply", {"replyToken": reply_token, "messages": messages})
 
-    async def push(self, chat_id: str, messages: List[Dict[str, Any]]) -> None:
-        await self._post_messages(LINE_PUSH_URL, "push", {"to": chat_id, "messages": messages})
+    async def push(self, chat_id: str, messages: List[Dict[str, Any]]) -> Optional[str]:
+        return await self._post_messages(LINE_PUSH_URL, "push", {"to": chat_id, "messages": messages})
 
     async def loading(self, chat_id: str, seconds: int = 60) -> None:
         """Loading indicator (DM only). LINE rejects this for groups/rooms."""
@@ -277,15 +282,71 @@ class _LineClient:
         except Exception:
             return None
 
+    async def mark_read(self, mark_as_read_token: str) -> None:
+        """Clear LINE's unread badge. The token arrives on the webhook event."""
+        if not mark_as_read_token:
+            return
+        try:
+            async with self._session(5.0) as session:
+                await session.post(
+                    LINE_MARK_AS_READ_URL, headers=self._headers,
+                    json={"markAsReadToken": mark_as_read_token})
+        except Exception as exc:
+            logger.debug("LINE mark_as_read failed: %s", exc)
+
+    async def get_group_member_profile(self, group_id: str, user_id: str) -> Optional[Dict[str, Any]]:
+        """Return a group member's displayName and pictureUrl, or None."""
+        if not group_id or not user_id:
+            return None
+        url = LINE_GROUP_MEMBER_PROFILE_URL_FMT.format(group_id=group_id, user_id=user_id)
+        try:
+            async with self._session(10.0) as session:
+                async with session.get(url, headers=self._headers) as resp:
+                    if resp.status >= 400:
+                        return None
+                    data = await resp.json(content_type=None)
+                    return data if isinstance(data, dict) and data else None
+        except Exception:
+            return None
+
 
 def _text_message(text: str) -> Dict[str, Any]:
     """Build a LINE text message object, capped to per-bubble max."""
     return {"type": "text", "text": text if len(text) <= LINE_PER_BUBBLE_CHARS else text[: LINE_PER_BUBBLE_CHARS - 1] + "…"}
 
 
+def _strip_think_blocks(content: str) -> str:
+    """Drop reasoning and tool XML before a bubble is cached or sent.
+
+    ``agent.agent_runtime_helpers.strip_think_blocks`` ignores its agent argument.
+    A failed import leaves the text unchanged so a send never dies on cleanup.
+    """
+    if not content:
+        return content
+    try:
+        from agent.agent_runtime_helpers import strip_think_blocks
+        return strip_think_blocks(None, content)
+    except Exception:
+        logger.debug("LINE: think-block strip failed", exc_info=True)
+        return content
+
+
+async def _first_sent_message_id(resp) -> Optional[str]:
+    """LINE reply/push bodies carry ``sentMessages[0].id`` when the call succeeds."""
+    try:
+        data = await resp.json(content_type=None)
+    except Exception:
+        return None
+    sent = (data or {}).get("sentMessages") if isinstance(data, dict) else None
+    if not sent:
+        return None
+    message_id = sent[0].get("id")
+    return str(message_id) if message_id else None
+
+
 def _text_messages(content: str) -> List[Dict[str, Any]]:
-    """Markdown-strip, chunk and cap ``content`` into ≤5 LINE text messages."""
-    chunks = split_for_line(strip_markdown_preserving_urls(content))
+    """Think-strip, markdown-strip, chunk and cap ``content`` into ≤5 LINE text messages."""
+    chunks = split_for_line(strip_markdown_preserving_urls(_strip_think_blocks(content)))
     return [_text_message(c) for c in chunks][:LINE_MAX_MESSAGES_PER_CALL]
 
 
@@ -377,7 +438,13 @@ class LineAdapter(BasePlatformAdapter):
 
     def __init__(self, config, **kwargs):
         super().__init__(config=config, platform=Platform("line"))
-        extra = getattr(config, "extra", {}) or {}
+        # One LINE chat is one session. Mutate the real extra dict only — a
+        # missing extra is a fresh {} and writing it would not update config.
+        raw_extra = getattr(config, "extra", None)
+        if isinstance(raw_extra, dict):
+            raw_extra["group_sessions_per_user"] = False
+            raw_extra["thread_sessions_per_user"] = False
+        extra = raw_extra if isinstance(raw_extra, dict) else {}
 
         def env_or(env: str, key: str, default: Any = "") -> Any:
             return _get_scoped_secret(env) or extra.get(key, default)
@@ -419,6 +486,93 @@ class LineAdapter(BasePlatformAdapter):
         self._media_temp_paths: Set[str] = set()
         self._media_ttl = MEDIA_TOKEN_TTL_SECONDS
         self._pending_buttons: Dict[str, str] = {}  # one outstanding button per chat: chat_id → request_id
+        self._group_last_addressed: Dict[str, float] = {}
+        self._last_bot_message_id: Optional[str] = None
+        continuation = env_or("LINE_GROUP_CONTINUATION_SECONDS", "group_continuation_seconds", "3600")
+        self._group_continuation_seconds = _coerce(float, continuation, 3600.0)
+        self._mention_patterns = self._compile_mention_patterns()
+
+    def _compile_mention_patterns(self) -> List[re.Pattern]:
+        """Wake words from LINE_MENTION_KEYWORDS, LINE_GROUP_KEYWORD, or extra."""
+        raw = _get_scoped_secret("LINE_MENTION_KEYWORDS") or _get_scoped_secret("LINE_GROUP_KEYWORD") or ""
+        extra = getattr(self.config, "extra", None)
+        if not raw and isinstance(extra, dict):
+            raw = extra.get("mention_keywords") or extra.get("group_keyword") or ""
+        if isinstance(raw, (list, tuple)):
+            patterns = [str(item).strip() for item in raw if str(item).strip()]
+        else:
+            patterns = [part.strip() for part in str(raw).replace(",", "\n").splitlines() if part.strip()]
+        if not patterns:
+            return []
+        try:
+            from gateway.platforms.helpers import compile_mention_patterns
+            return compile_mention_patterns(
+                patterns, log_prefix="LINE", platform_label="line", logger_=logger)
+        except Exception as exc:
+            logger.warning("LINE: mention pattern compile failed: %s", exc)
+            return [re.compile(re.escape(part), re.IGNORECASE) for part in patterns]
+
+    def _message_mentions_bot(self, msg: Dict[str, Any], text: str = "") -> bool:
+        """True when LINE's mention struct (or the bot user id in the text) names this bot."""
+        mention = (msg or {}).get("mention") or {}
+        for mentionee in mention.get("mentionees") or []:
+            if not isinstance(mentionee, dict):
+                continue
+            if mentionee.get("isSelf") is True:
+                return True
+            uid = str(mentionee.get("userId") or "").strip()
+            if self._bot_user_id and uid and uid == self._bot_user_id:
+                return True
+        return bool(self._bot_user_id and self._bot_user_id in (text or ""))
+
+    def _message_matches_mention_patterns(self, text: str) -> bool:
+        if not text or not self._mention_patterns:
+            return False
+        return any(pattern.search(text) for pattern in self._mention_patterns)
+
+    def _walk_quoted_message_id(self, msg: Dict[str, Any], depth: int = 2) -> Optional[str]:
+        cur = msg or {}
+        for _ in range(depth):
+            if not isinstance(cur, dict):
+                return None
+            quoted_id = cur.get("quotedMessageId")
+            if quoted_id:
+                return str(quoted_id)
+            quoted = cur.get("quotedMessage") or cur.get("reply") or {}
+            if not isinstance(quoted, dict):
+                return None
+            quoted_id = quoted.get("messageId") or quoted.get("id")
+            if quoted_id:
+                return str(quoted_id)
+            cur = quoted.get("quotedMessage") or quoted
+        return None
+
+    def _is_addressed(self, event: Dict[str, Any]) -> bool:
+        """True when a group message @mentions the bot, matches a wake word, or quotes the bot."""
+        msg = event.get("message") if isinstance(event, dict) else None
+        if not isinstance(msg, dict):
+            msg = event if isinstance(event, dict) else {}
+        text = str(msg.get("text") or "") if isinstance(msg, dict) else ""
+        if self._message_mentions_bot(msg if isinstance(msg, dict) else {}, text):
+            return True
+        if self._message_matches_mention_patterns(text):
+            return True
+        quoted_id = self._walk_quoted_message_id(msg if isinstance(msg, dict) else {})
+        return bool(quoted_id and quoted_id == self._last_bot_message_id)
+
+    def _is_in_continuation_window(self, chat_id: str) -> bool:
+        if not chat_id:
+            return False
+        last = self._group_last_addressed.get(chat_id, 0.0)
+        return (time.time() - last) < self._group_continuation_seconds
+
+    def _mark_chat_addressed(self, chat_id: str) -> None:
+        if chat_id:
+            self._group_last_addressed[chat_id] = time.time()
+
+    def _remember_bot_message(self, message_id: Optional[str]) -> None:
+        if message_id:
+            self._last_bot_message_id = str(message_id)
 
     def _fail(self, code: str, detail: str, *, retryable: bool = False) -> bool:  # fatal connect error → False
         self._set_fatal_error(code, detail, retryable=retryable)
@@ -542,6 +696,17 @@ class LineAdapter(BasePlatformAdapter):
         source = event.get("source") or {}
         chat_id, chat_type = _resolve_chat(source)
         user_id = source.get("userId", "") or chat_id
+        # Groups stay quiet unless the bot is mentioned, a wake word matches,
+        # the message quotes the bot, or the chat is inside the continuation window.
+        if chat_type == "group":
+            if self._is_addressed(event):
+                self._mark_chat_addressed(chat_id)
+            elif not self._is_in_continuation_window(chat_id):
+                logger.debug("LINE: skipping non-addressed group message chat=%s", chat_id)
+                return
+        mark_as_read_token = event.get("markAsReadToken", "")
+        if mark_as_read_token and self._client:
+            asyncio.create_task(self._client.mark_read(mark_as_read_token))
         if chat_id and reply_token:  # stash the reply token for outbound use
             self._reply_tokens[chat_id] = (reply_token, time.time() + LINE_REPLY_TOKEN_TTL_SECONDS)
         media_urls: List[str] = []
@@ -565,9 +730,15 @@ class LineAdapter(BasePlatformAdapter):
         source_obj = self.build_source(
             chat_id=chat_id, chat_type=chat_type, user_id=user_id, user_name=user_id, chat_name=chat_id,
             message_id=message_id)
+        is_group = chat_type == "group"
         await self.handle_message(MessageEvent(
             text=text, message_type=_LINE_MESSAGE_TYPES.get(msg_type, MessageType.TEXT), source=source_obj,
-            raw_message=event, message_id=message_id, media_urls=media_urls, media_types=media_types))
+            raw_message=event, message_id=message_id, media_urls=media_urls, media_types=media_types,
+            metadata={
+                "is_mentioned": self._message_mentions_bot(msg, text) if is_group else True,
+                "keyword_matched": self._message_matches_mention_patterns(text) if is_group else False,
+                "line_group_addressed": True,
+            }))
 
     async def _handle_postback_event(self, event: Dict[str, Any]) -> None:
         """User tapped the slow-LLM postback button — deliver the cached payload. READY replies (push
@@ -655,7 +826,7 @@ class LineAdapter(BasePlatformAdapter):
         if pending_rid and not _is_interim_send(content, metadata):
             entry = self._cache.get(pending_rid)
             if entry is not None and entry.state is State.PENDING:
-                self._cache.set_ready(pending_rid, content)
+                self._cache.set_ready(pending_rid, _strip_think_blocks(content))
                 return SendResult(success=True, message_id=pending_rid)
             # Stale mapping: the entry is READY/DELIVERED/ERROR or gone entirely —
             # absorbing this send would silently swallow the answer behind a dead
@@ -868,24 +1039,29 @@ class LineAdapter(BasePlatformAdapter):
         batches = [messages[i:i + n] for i in range(0, len(messages), n)]
         token, used_reply = self._consume_reply_token(chat_id)
         start = 0
+        sent_id: Optional[str] = None
         if used_reply and not force_push:
             try:
-                await self._client.reply(token, batches[0])
+                sent_id = await self._client.reply(token, batches[0])
+                self._remember_bot_message(sent_id)
                 if text:
-                    return SendResult(success=True, message_id=token)
+                    return SendResult(success=True, message_id=sent_id or token)
                 start = 1
             except Exception as exc:
                 logger.info("LINE: reply token rejected (%s); falling back to push", exc)
         for i in range(start, len(batches)):  # push the rest (reply token is single-use)
             try:
-                await self._client.push(chat_id, batches[i])
+                pushed_id = await self._client.push(chat_id, batches[i])
+                if pushed_id:
+                    sent_id = str(pushed_id)
+                    self._remember_bot_message(sent_id)
             except Exception as exc:
                 if i > 0:
                     logger.warning("LINE: push for follow-up batch failed: %s", exc)
                 elif text:
                     logger.error("LINE: push send failed: %s", exc)
                 return SendResult(success=False, error=str(exc))
-        return SendResult(success=True, message_id=None)
+        return SendResult(success=True, message_id=sent_id)
 
 
 def _unlink_quietly(path: str) -> None:
@@ -941,8 +1117,8 @@ async def _standalone_send(
             t("platform.line.standalone.attachments_not_deliverable", count=str(len(media_files)))))
         messages = messages[:LINE_MAX_MESSAGES_PER_CALL]
     try:
-        await _LineClient(token).push(chat_id, messages)
-        return {"success": True, "message_id": None}
+        sent_id = await _LineClient(token).push(chat_id, messages)
+        return {"success": True, "message_id": sent_id}
     except Exception as exc:
         return send_error(str(exc))
 

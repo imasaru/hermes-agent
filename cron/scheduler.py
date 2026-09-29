@@ -2065,7 +2065,7 @@ def _final_response_from_result(result: dict, job_id: str, job_name: str, AIAgen
     return final_response
 
 
-def _finalize_cron_session(session_db, agent, job_id: str, job_name: str, cron_session_id: str) -> None:
+def _finalize_cron_session(session_db, agent, job_id: str, job_name: str, cron_session_id: str) -> Optional[str]:
     """Title, classify, end and release the cron session after the agent turn has returned."""
     # Bound every DB op so storage failure cannot hold the dispatch guard.
     _session_db = _BoundedCronSessionDB(session_db, job_id)
@@ -2152,6 +2152,7 @@ def _finalize_cron_session(session_db, agent, job_id: str, job_name: str, cron_s
         release_or_close(_session_db)
     except (Exception, KeyboardInterrupt) as e:
         logger.debug("Job '%s': failed to close SQLite session store: %s", job_id, e)
+    return _final_cron_session_id
 
 
 def _run_doc_header(job: dict, title: str, job_id: str, prompt: str) -> str:
@@ -2577,8 +2578,21 @@ def run_job(
         _worker_teardown_deferred = defer_teardown_to_running_worker(
             _worker_state.get("future"), _session_db, agent, job_id, job_name, _cron_session_id)
         scope.exit()
-        if _session_db and not _worker_teardown_deferred:
-            _finalize_cron_session(_session_db, agent, job_id, job_name, _cron_session_id)
+        try:
+            # Delivery runs after run_job returns and needs this id. Finalize may
+            # rotate onto a compression tip; otherwise keep the id this run opened.
+            _final_sid = _cron_session_id
+            if _session_db and not _worker_teardown_deferred:
+                _final_sid = (
+                    _finalize_cron_session(_session_db, agent, job_id, job_name, _cron_session_id)
+                    or _final_sid
+                )
+            elif agent is not None:
+                _final_sid = getattr(agent, "session_id", None) or _final_sid
+            if _final_sid:
+                job["_hermes_cron_session_id"] = _final_sid
+        except Exception:
+            logger.debug("Job '%s': could not stamp cron session id", job_id, exc_info=True)
         # Tear down the ephemeral agent or the gateway leaks fds per tick (EMFILE). With deferred
         # teardown, hand the live agent back: delivery needs a live async client.
         # Release subprocesses, terminal sandboxes, browser daemons, and the main OpenAI/httpx client held

@@ -12,17 +12,105 @@ import asyncio
 import concurrent.futures
 import contextlib
 import contextvars
+import json
 import logging
 import os
 import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, List, Optional
 
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("cron.scheduler")
+
+# The live Zulip plugin (and its August backup) resolve 📌/🔖 and /reply through
+# this file. Cron delivery writes it; adapters that already hold _zulip_to_session
+# get the same mapping warmed in memory. Failures must not break delivery.
+_ZULIP_SESSION_MAP_PATH = Path(
+    os.path.expanduser("~/.hermes/profiles/ai-agent/cron/zulip_session_map.json")
+)
+
+
+def _persist_zulip_session_map(zulip_msg_id: int, session_id: str) -> None:
+    """Append one zulip message id → cron session id mapping."""
+    try:
+        data: dict = {}
+        if _ZULIP_SESSION_MAP_PATH.exists():
+            try:
+                loaded = json.loads(_ZULIP_SESSION_MAP_PATH.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    data = loaded
+            except (json.JSONDecodeError, OSError):
+                data = {}
+        data[str(zulip_msg_id)] = session_id
+        _ZULIP_SESSION_MAP_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _ZULIP_SESSION_MAP_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except Exception as exc:
+        logger.warning("failed to persist zulip session map for %s: %s", zulip_msg_id, exc)
+
+
+def _zulip_message_id(result: Any) -> Optional[int]:
+    """Numeric Zulip id from a live message id or a standalone send result."""
+    if isinstance(result, dict):
+        raw = result.get("message_id")
+        if raw in (None, ""):
+            raw = result.get("id")
+    elif isinstance(result, (int, str)):
+        raw = result
+    else:
+        raw = getattr(result, "message_id", None)
+        if raw in (None, ""):
+            raw = getattr(result, "id", None)
+    if raw in (None, "", "-"):
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _warm_zulip_session_cache(adapters: Any, zulip_msg_id: int, session_id: str) -> None:
+    if not isinstance(adapters, dict):
+        return
+    adapter = adapters.get("zulip")
+    if adapter is None:
+        for key, value in adapters.items():
+            name = getattr(key, "value", key)
+            if str(name).lower() == "zulip":
+                adapter = value
+                break
+    cache = getattr(adapter, "_zulip_to_session", None)
+    if isinstance(cache, dict):
+        cache[int(zulip_msg_id)] = session_id
+
+
+def _persist_cron_zulip_session_mapping(
+    platform_name: str, session_id: Optional[str], result: Any, adapters: Any, job_id: str,
+) -> None:
+    """Remember a delivered Zulip cron message so a later reaction can find its session."""
+    if str(platform_name or "").lower() != "zulip" or not session_id or not result:
+        return
+    try:
+        zulip_msg_id = _zulip_message_id(result)
+        if zulip_msg_id is None:
+            return
+        _persist_zulip_session_map(zulip_msg_id, str(session_id))
+        try:
+            _warm_zulip_session_cache(adapters, zulip_msg_id, str(session_id))
+        except Exception:
+            pass
+        logger.debug(
+            "Job '%s': persisted Zulip session map %s -> %s",
+            job_id, zulip_msg_id, session_id,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Job '%s': failed to persist zulip session mapping for cron output: %s",
+            job_id, exc,
+        )
 
 
 # Validates user-supplied delivery platform names, preventing env-var enumeration via crafted names.
@@ -1678,6 +1766,10 @@ def _deliver_via_live_adapter(
                 delivered_message_id if delivered_message_id is not None else "-")
             delivered = True
             _seed_live_delivery_sessions(t, delivered_message_id)
+            _persist_cron_zulip_session_mapping(
+                t.platform_name, job.get("_hermes_cron_session_id"),
+                delivered_message_id, t.target_adapters, str(job.get("id") or ""),
+            )
     except Exception as e:
         err_msg = f"live adapter delivery to {t.where} failed: {e}"
         if not any(err_msg in err for err in target_errors):
@@ -1812,6 +1904,10 @@ def _deliver_standalone(
         logger.error("Job '%s': %s", job["id"], msg)
         delivery_errors.append(msg)
     logger.info("Job '%s': delivered to %s:%s", job["id"], t.platform_name, t.chat_id)
+    _persist_cron_zulip_session_mapping(
+        t.platform_name, job.get("_hermes_cron_session_id"),
+        result, t.target_adapters, str(job.get("id") or ""),
+    )
     # Thread seeding only happens on the live lane, so no thread_seeded gate applies here.
     _maybe_mirror_cron_delivery(
         job, t.platform_name, t.chat_id, t.mirror_text, thread_id=t.thread_id,

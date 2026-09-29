@@ -1144,9 +1144,22 @@ class _CrashSweep:
 
 
 def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None) -> _CrashSweep:
-    """Release every host-local ``running`` task whose worker PID is dead."""
+    """Release every host-local ``running`` task whose worker PID is dead.
+
+    Delegated children may run this idempotent reclaim. A read-only fenced
+    connection returns an empty sweep instead of failing the caller.
+    """
     sweep = _CrashSweep()
-    with _kb.write_txn(conn):
+    try:
+        _reclaim_dead_workers_txn(conn, board, sweep)
+    except sqlite3.OperationalError as exc:
+        if "readonly" not in str(exc).lower():
+            raise
+    return sweep
+
+
+def _reclaim_dead_workers_txn(conn: sqlite3.Connection, board: Optional[str], sweep: _CrashSweep) -> None:
+    with _kb.write_txn(conn, allow_delegated=True):
         rows = conn.execute(
             "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee "
             "FROM tasks "
@@ -1210,7 +1223,6 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             else:
                 sweep.crashed.append(row["id"])
                 sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
-    return sweep
 
 
 def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]:

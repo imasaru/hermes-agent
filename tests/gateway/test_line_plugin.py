@@ -180,6 +180,7 @@ class TestInboundMedia:
         ad = LineAdapter(cfg)
         ad._client = MagicMock()
         ad._client.fetch_content = AsyncMock(return_value=b"line-bytes")
+        ad._client.loading = AsyncMock()
         ad.handle_message = AsyncMock()
         return ad
 
@@ -189,7 +190,7 @@ class TestInboundMedia:
         return {
             "type": "message",
             "replyToken": "reply-token",
-            "source": {"type": "group", "groupId": "Cline", "userId": "Uline"},
+            "source": {"type": "user", "userId": "Uline"},
             "message": payload,
         }
 
@@ -526,4 +527,69 @@ class TestMediaPublicUrlGuard:
         result = asyncio.run(ad.send_image_file("Uchat", str(img)))
         assert not result.success
         assert "LINE_PUBLIC_URL" in (result.error or "")
+
+
+class TestLineGroupSessions:
+    """LINE groups share one session per chat and ignore messages that do not address the bot."""
+
+    def _adapter(self, monkeypatch, **extra):
+        monkeypatch.delenv("LINE_CHANNEL_ACCESS_TOKEN", raising=False)
+        monkeypatch.delenv("LINE_CHANNEL_SECRET", raising=False)
+        monkeypatch.delenv("LINE_MENTION_KEYWORDS", raising=False)
+        monkeypatch.delenv("LINE_GROUP_KEYWORD", raising=False)
+        from gateway.config import PlatformConfig
+        base = {"channel_access_token": "tok", "channel_secret": "sec", "mention_keywords": ["hermes"]}
+        base.update(extra)
+        ad = LineAdapter(PlatformConfig(enabled=True, extra=base))
+        ad._client = MagicMock()
+        ad._client.mark_read = AsyncMock()
+        ad.handle_message = AsyncMock()
+        return ad
+
+    def test_group_session_key_ignores_participant(self):
+        from gateway.config import Platform
+        from gateway.session import SessionSource, build_session_key
+        platform = Platform("line")
+        alice = SessionSource(platform=platform, chat_id="C1", chat_type="group", user_id="Ua")
+        bob = SessionSource(platform=platform, chat_id="C1", chat_type="group", user_id="Ub")
+        assert build_session_key(alice, group_sessions_per_user=True) == build_session_key(
+            bob, group_sessions_per_user=True)
+        assert build_session_key(alice).endswith(":C1")
+
+    def test_unaddressed_group_message_is_skipped(self, monkeypatch):
+        adapter = self._adapter(monkeypatch)
+        event = {
+            "type": "message", "replyToken": "t",
+            "source": {"type": "group", "groupId": "C1", "userId": "Ua"},
+            "message": {"type": "text", "id": "m1", "text": "hello everyone"},
+        }
+        asyncio.run(adapter._handle_message_event(event))
+        adapter.handle_message.assert_not_awaited()
+
+    def test_keyword_addresses_the_group_and_opens_the_continuation_window(self, monkeypatch):
+        adapter = self._adapter(monkeypatch)
+        addressed = {
+            "type": "message", "replyToken": "t", "markAsReadToken": "read-1",
+            "source": {"type": "group", "groupId": "C1", "userId": "Ua"},
+            "message": {"type": "text", "id": "m1", "text": "hey hermes"},
+        }
+        asyncio.run(adapter._handle_message_event(addressed))
+        event = adapter.handle_message.await_args.args[0]
+        assert event.metadata["keyword_matched"] is True
+        assert event.metadata["line_group_addressed"] is True
+        adapter._client.mark_read.assert_awaited()
+        follow = {
+            "type": "message", "replyToken": "t2",
+            "source": {"type": "group", "groupId": "C1", "userId": "Ub"},
+            "message": {"type": "text", "id": "m2", "text": "and also this"},
+        }
+        asyncio.run(adapter._handle_message_event(follow))
+        assert adapter.handle_message.await_count == 2
+
+    def test_cached_answer_strips_think_blocks(self, monkeypatch):
+        adapter = self._adapter(monkeypatch)
+        rid = adapter._cache.register_pending("Uchat")
+        adapter._pending_buttons["Uchat"] = rid
+        asyncio.run(adapter.send("Uchat", "<think>hidden</think>Visible answer"))
+        assert adapter._cache.get(rid).payload == "Visible answer"
 
