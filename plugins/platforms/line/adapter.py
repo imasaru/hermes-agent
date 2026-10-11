@@ -26,6 +26,8 @@ import mimetypes
 import os
 import re
 import secrets
+from datetime import datetime, timezone as _dt_timezone, timedelta, tzinfo
+from zoneinfo import ZoneInfo
 import sys
 import tempfile
 import time
@@ -309,6 +311,21 @@ class _LineClient:
         except Exception:
             return None
 
+    async def get_user_profile(self, user_id: str) -> Optional[Dict[str, Any]]:
+        """Return a user's displayName and pictureUrl (personal profile endpoint)."""
+        if not user_id:
+            return None
+        url = f"https://api.line.me/v2/bot/profile/{user_id}"
+        try:
+            async with self._session(10.0) as session:
+                async with session.get(url, headers=self._headers) as resp:
+                    if resp.status >= 400:
+                        return None
+                    data = await resp.json(content_type=None)
+                    return data if isinstance(data, dict) and data else None
+        except Exception:
+            return None
+
 
 def _text_message(text: str) -> Dict[str, Any]:
     """Build a LINE text message object, capped to per-bubble max."""
@@ -488,9 +505,35 @@ class LineAdapter(BasePlatformAdapter):
         self._pending_buttons: Dict[str, str] = {}  # one outstanding button per chat: chat_id → request_id
         self._group_last_addressed: Dict[str, float] = {}
         self._last_bot_message_id: Optional[str] = None
+        self._display_names: Dict[str, str] = {}  # userId → displayName
+        self._names_bridged: Set[str] = set()  # one-time bridge for first friendly name
+        self._bot_last_sent: Dict[str, float] = {}  # chat_id → last bot send timestamp (reply-to-bot fallback)
+        self._last_group_chat_id: Optional[str] = None  # most recent group chat for continuation tracking
         continuation = env_or("LINE_GROUP_CONTINUATION_SECONDS", "group_continuation_seconds", "3600")
         self._group_continuation_seconds = _coerce(float, continuation, 3600.0)
         self._mention_patterns = self._compile_mention_patterns()
+
+        # Timezone for message timestamps (default: Asia/Tokyo / JST).
+        # Accepts IANA tz names (e.g. "America/New_York", "Europe/London")
+        # or fixed offsets like "UTC+9", "UTC-5".
+        self._tz_name = env_or("LINE_TIMEZONE", "timezone", "Asia/Tokyo")
+        self._tz: Optional[tzinfo] = None
+        try:
+            self._tz = ZoneInfo(self._tz_name)
+        except Exception:
+            m = re.match(r"UTC([+-])(\d{1,2})(?::(\d{2}))?", self._tz_name)
+            if m:
+                sign = 1 if m.group(1) == "+" else -1
+                hours = int(m.group(2))
+                mins = int(m.group(3)) if m.group(3) else 0
+                self._tz = _dt_timezone(timedelta(hours=sign * hours, minutes=sign * mins))
+            else:
+                self._tz = _dt_timezone.utc
+                logger.warning("LINE: unrecognized timezone '%s', defaulting to UTC", self._tz_name)
+
+    def _group_reply_mode(self) -> str:
+        """Group reply mode: 'addressed_only', 'all_messages', or 'continuation_only'."""
+        return _get_scoped_secret("LINE_GROUP_REPLY_MODE") or "addressed_only"
 
     def _compile_mention_patterns(self) -> List[re.Pattern]:
         """Wake words from LINE_MENTION_KEYWORDS, LINE_GROUP_KEYWORD, or extra."""
@@ -548,7 +591,26 @@ class LineAdapter(BasePlatformAdapter):
         return None
 
     def _is_addressed(self, event: Dict[str, Any]) -> bool:
-        """True when a group message @mentions the bot, matches a wake word, or quotes the bot."""
+        """True when a group message @mentions the bot, matches a wake word, or quotes the bot.
+
+        Multi-layer detection:
+        1. Native @mention (isSelf: true or userId match)
+        2. Keyword trigger (LINE_MENTION_KEYWORDS / LINE_GROUP_KEYWORD)
+        3. Reply to bot ID match (quotedMessageId == _last_bot_message_id)
+        4. Reply to bot userId match (quotedMessage.sender.userId == bot userId)
+        5. Bot-sent timestamp (bot spoke recently in this chat)
+
+        Short-circuit based on LINE_GROUP_REPLY_MODE:
+        - 'all_messages' → always True (no need to check layers)
+        - 'continuation_only' → True if in continuation window
+        - 'addressed_only' → run full multi-layer detection
+        """
+        mode = self._group_reply_mode()
+        if mode == "all_messages":
+            return True
+        if mode == "continuation_only" and self._last_group_chat_id and self._is_in_continuation_window(self._last_group_chat_id):
+            return True
+        # addressed_only: run full detection
         msg = event.get("message") if isinstance(event, dict) else None
         if not isinstance(msg, dict):
             msg = event if isinstance(event, dict) else {}
@@ -557,8 +619,23 @@ class LineAdapter(BasePlatformAdapter):
             return True
         if self._message_matches_mention_patterns(text):
             return True
+        # Layer 3: ID match (unreliable but free — LINE rarely populates sentMessages[].id)
         quoted_id = self._walk_quoted_message_id(msg if isinstance(msg, dict) else {})
-        return bool(quoted_id and quoted_id == self._last_bot_message_id)
+        if quoted_id and quoted_id == self._last_bot_message_id:
+            return True
+        # Layer 4: quotedMessage.sender.userId matches bot userId
+        quoted = msg.get("quotedMessage") or {}
+        if isinstance(quoted, dict):
+            quoted_sender_id = str(quoted.get("userId", "") or "")
+            if self._bot_user_id and quoted_sender_id and quoted_sender_id == self._bot_user_id:
+                logger.debug("LINE: group reply-to-bot detected via quotedMessage.sender.userId=%s", quoted_sender_id)
+                return True
+        # Layer 5: bot-sent timestamp (reply shortly after bot spoke)
+        chat_id = event.get("source", {}).get("groupId", "")
+        if chat_id and self._bot_recently_sent(chat_id):
+            logger.debug("LINE: group reply-to-bot detected via bot-sent timestamp in %s", chat_id)
+            return True
+        return False
 
     def _is_in_continuation_window(self, chat_id: str) -> bool:
         if not chat_id:
@@ -573,6 +650,131 @@ class LineAdapter(BasePlatformAdapter):
     def _remember_bot_message(self, message_id: Optional[str]) -> None:
         if message_id:
             self._last_bot_message_id = str(message_id)
+
+    def _note_bot_sent(self, chat_id: str) -> None:
+        """Record that the bot just sent a message in this chat (reply-to-bot fallback)."""
+        if chat_id:
+            self._bot_last_sent[chat_id] = time.time()
+
+    def _bot_recently_sent(self, chat_id: str, window_seconds: int = 3600) -> bool:
+        """Check if the bot sent a message in this chat within the window."""
+        if not chat_id:
+            return False
+        last = self._bot_last_sent.get(chat_id, 0)
+        return bool(last and (time.time() - last) < window_seconds)
+
+    def _get_display_name(self, user_id: str) -> str:
+        """Return cached display name or fall back to user_id."""
+        return self._display_names.get(user_id, user_id)
+
+    def _get_bridged_display_name(self, user_id: str) -> str:
+        """Return label with one-time bridge: first time shows 'Name|Uxxxx', then just 'Name'."""
+        if not user_id:
+            return "unknown"
+        display = self._get_display_name(user_id)
+        has_friendly = bool(display and display != user_id)
+        if has_friendly and user_id not in self._names_bridged:
+            self._names_bridged.add(user_id)
+            return f"{display}|{user_id}"
+        return display if has_friendly else user_id
+
+    async def _ensure_display_name(self, user_id: str, chat_id: Optional[str] = None) -> None:
+        """Background fetch display name and cache it."""
+        if user_id in self._display_names:
+            return
+        if self._client:
+            try:
+                if chat_id and chat_id.startswith("C"):
+                    profile = await self._client.get_group_member_profile(chat_id, user_id)
+                else:
+                    profile = await self._client.get_user_profile(user_id)
+                if profile and profile.get("displayName"):
+                    self._display_names[user_id] = profile["displayName"]
+            except Exception:
+                pass
+
+    async def _resolve_display_name_now(self, user_id: str, chat_id: Optional[str] = None) -> None:
+        """Await a short profile fetch if name is not yet cached. For current-message attribution."""
+        if user_id in self._display_names:
+            return  # already cached, no need to block
+        if self._client:
+            try:
+                if chat_id and chat_id.startswith("C"):
+                    profile = await self._client.get_group_member_profile(chat_id, user_id)
+                else:
+                    profile = await self._client.get_user_profile(user_id)
+                if profile and profile.get("displayName"):
+                    self._display_names[user_id] = profile["displayName"]
+            except Exception:
+                pass
+        # Fallback to personal endpoint if still not cached
+        if user_id not in self._display_names and self._client:
+            try:
+                profile = await self._client.get_user_profile(user_id)
+                if profile and profile.get("displayName"):
+                    self._display_names[user_id] = profile["displayName"]
+            except Exception:
+                pass
+
+    def _observe_group_message(
+        self, chat_id: str, user_id: str, display_name: str, text: str,
+        *,
+        message_id: Optional[str] = None,
+        timestamp: Optional[int] = None,
+    ) -> None:
+        """Append a non-addressed group message to the session transcript for context.
+
+        Uses bridged display name for attribution. Does NOT mark read — unread dot
+        stays as a "will Luman respond?" signal. Does NOT dispatch to LLM.
+        """
+        store = getattr(self, "_session_store", None)
+        if not store:
+            return
+        try:
+            # Kick off background display name fetch (fire-and-forget)
+            if self._client:
+                asyncio.create_task(self._ensure_display_name(user_id, chat_id))
+            # Resolve bridged display name for attribution
+            bridged_name = self._get_bridged_display_name(user_id)
+
+            # Format timestamp for attribution (LINE event timestamp: ms since epoch).
+            # Uses the configured timezone (default: Asia/Tokyo / JST).
+            _obs_ts = ""
+            if timestamp and self._tz:
+                try:
+                    from datetime import datetime
+                    _dt = datetime.fromtimestamp(timestamp / 1000, tz=self._tz)
+                    _obs_ts = _dt.strftime(" | %Y-%m-%d %H:%M:%S %Z")
+                except Exception:
+                    pass
+
+            attributed = f"[{bridged_name}{_obs_ts}]\n{text}"
+            # Build source object for session store
+            from gateway.session import SessionSource
+            from gateway.config import Platform
+            source = SessionSource(
+                platform=Platform("line"),
+                chat_id=chat_id,
+                chat_type="group",
+                user_id=user_id,
+                user_name=bridged_name,
+                chat_name=chat_id,
+            )
+            entry: dict = {
+                "role": "user",
+                "content": attributed,
+                "timestamp": __import__("datetime").datetime.now(tz=__import__("datetime").timezone.utc).isoformat(),
+                "observed": True,
+            }
+            if message_id:
+                entry["message_id"] = message_id
+            session_entry = store.get_or_create_session(source)
+            store.append_to_transcript(
+                session_entry.session_id,
+                entry,
+            )
+        except Exception as exc:
+            logger.warning("LINE: Failed to observe group message: %s", exc)
 
     def _fail(self, code: str, detail: str, *, retryable: bool = False) -> bool:  # fatal connect error → False
         self._set_fatal_error(code, detail, retryable=retryable)
@@ -696,17 +898,43 @@ class LineAdapter(BasePlatformAdapter):
         source = event.get("source") or {}
         chat_id, chat_type = _resolve_chat(source)
         user_id = source.get("userId", "") or chat_id
+        # Track the most recent group chat for continuation_only mode
+        if chat_type == "group":
+            self._last_group_chat_id = chat_id
         # Groups stay quiet unless the bot is mentioned, a wake word matches,
         # the message quotes the bot, or the chat is inside the continuation window.
         if chat_type == "group":
             if self._is_addressed(event):
+                logger.info("LINE: group message addressed in %s from %s", chat_id, user_id)
                 self._mark_chat_addressed(chat_id)
+                # Resolve display name now for immediate attribution
+                if self._client:
+                    await self._resolve_display_name_now(user_id, chat_id)
+                # Fire-and-forget for future messages
+                if self._client:
+                    asyncio.create_task(self._ensure_display_name(user_id, chat_id))
             elif not self._is_in_continuation_window(chat_id):
-                logger.debug("LINE: skipping non-addressed group message chat=%s", chat_id)
+                # Observe non-addressed group messages for full conversation context.
+                # Append to transcript with attribution; do NOT mark read (unread dot
+                # stays as a "will Luman respond?" signal).
+                # Resolve display name now for immediate attribution
+                if self._client:
+                    await self._resolve_display_name_now(user_id, chat_id)
+                text = msg.get("text", "") or ""
+                display_name = self._display_names.get(user_id, user_id)
+                name = display_name.strip() if display_name and display_name != user_id else user_id
+                logger.info("LINE: group message NOT addressed in %s from %s — observing only", chat_id, user_id)
+                _line_ts = event.get("timestamp")
+                self._observe_group_message(chat_id, user_id, name, text, message_id=message_id, timestamp=_line_ts)
                 return
-        mark_as_read_token = event.get("markAsReadToken", "")
+        # markAsReadToken lives inside the message object (not at event level).
+        # Only mark read for messages that trigger a response.
+        mark_as_read_token = msg.get("markAsReadToken") or event.get("markAsReadToken")
         if mark_as_read_token and self._client:
+            logger.info("LINE: marking read for chat %s (token present, chat_type=%s)", chat_id, chat_type)
             asyncio.create_task(self._client.mark_read(mark_as_read_token))
+        else:
+            logger.debug("LINE: skipping mark_read for chat %s (token=%s, client=%s)", chat_id, bool(mark_as_read_token), bool(self._client))
         if chat_id and reply_token:  # stash the reply token for outbound use
             self._reply_tokens[chat_id] = (reply_token, time.time() + LINE_REPLY_TOKEN_TTL_SECONDS)
         media_urls: List[str] = []
@@ -1061,6 +1289,8 @@ class LineAdapter(BasePlatformAdapter):
                 elif text:
                     logger.error("LINE: push send failed: %s", exc)
                 return SendResult(success=False, error=str(exc))
+        # Record bot send time for reply-to-bot timestamp detection (layer 5)
+        self._note_bot_sent(chat_id)
         return SendResult(success=True, message_id=sent_id)
 
 
@@ -1070,7 +1300,10 @@ def _unlink_quietly(path: str) -> None:
 
 
 def _env_credentials_present() -> bool:
-    return bool(_get_scoped_secret("LINE_CHANNEL_ACCESS_TOKEN") and _get_scoped_secret("LINE_CHANNEL_SECRET"))
+    return bool(
+        _get_scoped_secret("LINE_CHANNEL_ACCESS_TOKEN", external_fallback=True)
+        and _get_scoped_secret("LINE_CHANNEL_SECRET", external_fallback=True)
+    )
 
 
 def check_requirements() -> bool:

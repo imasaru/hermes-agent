@@ -1172,6 +1172,32 @@ def _uses_telegram_observed_group_context(channel_prompt: Optional[str]) -> bool
     return bool(channel_prompt and _TELEGRAM_OBSERVED_CONTEXT_PROMPT_MARKER in channel_prompt)
 
 
+# Platforms whose adapters always write unaddressed group chatter as observed=True rows
+# (no channel-prompt opt-in marker). Those rows are background context, never user turns.
+_ALWAYS_SEPARATE_OBSERVED_PLATFORMS = frozenset({"line"})
+
+
+def _platform_name(platform: Any) -> str:
+    """Normalize a Platform enum / plugin platform / string to its lowercase value."""
+    if platform is None:
+        return ""
+    return str(getattr(platform, "value", platform) or "").strip().lower()
+
+
+def _uses_observed_group_context(channel_prompt: Optional[str], platform: Any = None) -> bool:
+    """True when observed=True rows must be withheld from replay and attached as context.
+
+    Telegram opts in via its channel-prompt marker; LINE always records observed group rows."""
+    return (_uses_telegram_observed_group_context(channel_prompt)
+            or _platform_name(platform) in _ALWAYS_SEPARATE_OBSERVED_PLATFORMS)
+
+
+def _observed_group_context_header(platform: Any = None) -> str:
+    if _platform_name(platform) == "line":
+        return "[Observed LINE group context - context only, not requests]"
+    return _OBSERVED_GROUP_CONTEXT_HEADER
+
+
 def _csv_or_list_to_set(raw: Any) -> set[str]:
     """Normalize a config list or comma-separated scalar into a string set."""
     if raw is None:
@@ -1244,7 +1270,7 @@ def _has_replayable_sidecar(role: Any, content: Any, msg: Dict[str, Any]) -> boo
 
 def _build_gateway_agent_history(
     history: List[Dict[str, Any]], *, channel_prompt: Optional[str] = None,
-    inject_timestamps: bool = False) -> tuple[List[Dict[str, Any]], Optional[str]]:
+    inject_timestamps: bool = False, platform: Any = None) -> tuple[List[Dict[str, Any]], Optional[str]]:
     """Convert stored gateway transcript rows into agent replay messages.
 
     Observed context stays out of ``conversation_history`` so consecutive-user repair can't merge it in."""
@@ -1257,7 +1283,7 @@ def _build_gateway_agent_history(
     _msg_tz = _get_msg_tz()
     agent_history: List[Dict[str, Any]] = []
     observed_group_context: List[str] = []
-    separate_observed_context = _uses_telegram_observed_group_context(channel_prompt)
+    separate_observed_context = _uses_observed_group_context(channel_prompt, platform)
 
     for msg in history or []:
         role = msg.get("role")
@@ -1342,12 +1368,13 @@ def _select_cached_agent_history(
     return persisted_history
 
 
-def _wrap_current_message_with_observed_context(message: Any, observed_context: Optional[str]) -> Any:
-    """Prepend observed Telegram context to the API-only current user turn."""
+def _wrap_current_message_with_observed_context(
+        message: Any, observed_context: Optional[str], platform: Any = None) -> Any:
+    """Prepend observed group context (Telegram/LINE) to the API-only current user turn."""
     if not observed_context:
         return message
 
-    prefix = f"{_OBSERVED_GROUP_CONTEXT_HEADER}\n{observed_context}\n\n{_CURRENT_ADDRESSED_MESSAGE_HEADER}\n"
+    prefix = f"{_observed_group_context_header(platform)}\n{observed_context}\n\n{_CURRENT_ADDRESSED_MESSAGE_HEADER}\n"
 
     if isinstance(message, str):
         return f"{prefix}{message}"
@@ -3353,7 +3380,10 @@ _BUILTIN_ADAPTERS: dict[Platform, tuple[str, str, str, str]] = {
     Platform.QQBOT: ("qqbot", "QQAdapter", "check_qq_requirements",
                      "QQBot: aiohttp/httpx missing or QQ_APP_ID/QQ_CLIENT_SECRET not configured"),
     Platform.YUANBAO: ("yuanbao", "YuanbaoAdapter", "WEBSOCKETS_AVAILABLE",
-                       "Yuanbao: websockets not installed. Run: pip install websockets")}
+                       "Yuanbao: websockets not installed. Run: pip install websockets"),
+    # Dynamic member: LINE is a bundled plugin, not a static Platform attribute.
+    Platform("line"): ("line", "LineAdapter", "check_requirements",
+                       "LINE: LINE_CHANNEL_ACCESS_TOKEN or LINE_CHANNEL_SECRET not configured")}
 
 
 def _instantiate_builtin_adapter(platform: Platform, config: Any) -> Optional[BasePlatformAdapter]:
