@@ -1347,6 +1347,14 @@ class GatewayStartupMixin:
         finally:
             # Startup authority is one phase: from here on every adapter retry is non-evicting.
             self._platform_lock_takeover_on_start = False
+        # Plugin platforms (e.g. zulip) register while their profile's adapters start, after the
+        # session store loaded; rows skipped then for an unknown platform are restored now.
+        _retry = getattr(getattr(self, "session_store", None), "retry_unresolved_entries", None)
+        if callable(_retry):
+            try:
+                _retry()
+            except Exception:
+                logger.warning("Restoring deferred routing entries failed", exc_info=True)
         # A platform skipped on the primary should have been picked up by a secondary owning the token;
         # if none did, the platform is enabled in config.yaml yet silently unserved — surface it loudly so
         # the operator sees a config problem instead of a quiet dead channel (#64674 follow-up).
