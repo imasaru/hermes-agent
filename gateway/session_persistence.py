@@ -243,6 +243,8 @@ class SessionPersistenceMixin:
         try:
             for key, entry_json in loader(scope=self._routing_scope()).items():
                 entry = self._routing_entry_from_json(key, entry_json)
+                if entry is None:
+                    self._remember_unresolved_entry(key, entry_json)
                 if entry is not None:
                     self._entries[key] = entry
             return True
@@ -307,6 +309,7 @@ class SessionPersistenceMixin:
                     imported += 1
                 except (ValueError, KeyError, TypeError) as e:
                     logger.warning("Skipping invalid session entry %r: %s", key, e)
+                    self._remember_unresolved_entry(key, entry_data)
             if imported and db_had_entries:
                 logger.info(
                     "gateway.session: imported %d legacy sessions.json entr%s missing from "
@@ -390,9 +393,47 @@ class SessionPersistenceMixin:
             "a crashed gateway", key, entry.session_id, row["end_reason"])
         return "prune"
 
+    def _remember_unresolved_entry(self, key: str, raw: Any) -> None:
+        """Keep a row whose platform is not resolvable yet (e.g. a profile-scoped plugin platform
+        such as zulip that registers after the store loads) so full saves do not drop it and
+        ``retry_unresolved_entries`` can restore it later. Lock held."""
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except ValueError:
+                return
+        if isinstance(raw, dict) and isinstance(raw.get("platform"), str):
+            if getattr(self, "_unresolved_entries", None) is None:
+                self._unresolved_entries = {}
+            self._unresolved_entries[key] = raw
+
+    def retry_unresolved_entries(self) -> int:
+        """Re-parse rows skipped at load; call once plugin platforms are registered. Returns the
+        number restored; rows that still fail stay preserved."""
+        from gateway.session import SessionEntry
+        restored = 0
+        with self._lock:
+            pending = getattr(self, "_unresolved_entries", None) or {}
+            for key, raw in list(pending.items()):
+                if key in self._entries:
+                    pending.pop(key, None)
+                    continue
+                try:
+                    self._entries[key] = SessionEntry.from_dict(raw)
+                except (ValueError, KeyError, TypeError):
+                    continue
+                pending.pop(key, None)
+                restored += 1
+        if restored:
+            logger.info("gateway.session: restored %d routing entr%s after plugin platform "
+                        "registration", restored, "y" if restored == 1 else "ies")
+        return restored
+
     def _entries_as_dicts(self) -> dict[str, Any]:
-        """Serializable snapshot of ``_entries``. Lock held."""
-        return {key: entry.to_dict() for key, entry in self._entries.items()}
+        """Serializable snapshot of `_entries` plus preserved unresolved rows. Lock held."""
+        data = {k: dict(v) for k, v in (getattr(self, "_unresolved_entries", None) or {}).items()}
+        data.update({key: entry.to_dict() for key, entry in self._entries.items()})
+        return data
 
     def _save(self) -> None:
         """Persist the routing index while the caller holds ``_lock``."""
