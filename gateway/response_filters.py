@@ -124,8 +124,14 @@ def is_machinery_display_kind(display_kind: Any) -> bool:
 
 
 def silence_allowed(display_kind: Any, reply_expected: Optional[bool] = None) -> bool:
-    """Whether a successful bare silence marker may remain silent for this turn."""
-    return is_machinery_display_kind(display_kind) or reply_expected is False
+    """Whether a successful bare silence marker may remain silent for this turn.
+
+    Silence is allowed when the adapter could not determine if the bot was addressed
+    (reply_expected=None) or explicitly confirmed it was not (reply_expected=False).
+    Silence is rejected only when the adapter explicitly confirmed the bot was addressed
+    (reply_expected=True, e.g. an @mention).
+    """
+    return is_machinery_display_kind(display_kind) or reply_expected is not True
 
 
 def reply_expected_metadata(reply_expected: Optional[bool]) -> dict:

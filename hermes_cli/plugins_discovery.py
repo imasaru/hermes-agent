@@ -288,6 +288,14 @@ def gate_manifest(
     if manifest.kind == "model-provider":
         return _placeholder(
             None, logging.DEBUG, "Skipping '%s' (model-provider, handled by providers/ discovery)", enabled=True)
+    # plugins.enabled opt-in must come BEFORE bundled deferred default so explicitly enabled
+    # bundled platforms load eagerly instead of waiting for first use.
+    if enabled is not None and names & enabled:
+        if manifest.source == "bundled":
+            if manifest.kind == "backend":
+                return ManifestGate("load_now")
+            if manifest.kind == "platform":
+                return ManifestGate("load_now")
     if manifest.source == "bundled":
         # Bundled backends auto-load; selection among them is ``<category>.provider`` config.
         if manifest.kind == "backend":
