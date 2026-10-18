@@ -2128,6 +2128,20 @@ def _deliver_result(
     else:
         delivery_content = content
 
+    # Topic-session marker so the Zulip poll loop can record this delivery.
+    # Import path: cron.scheduler_delivery → cron.zulip_marker
+    # (→ zulip.topic_ingest when that package is importable). Fail-safe:
+    # ImportError or any exception delivers unmarked content.
+    try:
+        from .zulip_marker import (
+            append_cron_marker as _zt_marker,  # noqa: F401  (import path tests)
+            safe_append_cron_marker_for_delivery as _zt_safe,
+        )
+
+        delivery_content = _zt_safe(delivery_content, targets, job)
+    except Exception:
+        logger.warning("zulip cron marker append failed", exc_info=True)
+
     from gateway.platforms.base import BasePlatformAdapter
     # Bridge media-policy config into the env vars the path validator reads. The gateway does this
     # at boot; standalone runs (`hermes cron run`) did not, silently dropping files. Idempotent.
