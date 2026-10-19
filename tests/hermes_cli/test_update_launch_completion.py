@@ -369,6 +369,29 @@ def test_blessed_legacy_install_is_adopted_before_sync(tmp_path, monkeypatch, co
     assert calls == [(["all"],)]
 
 
+def test_relaunch_script_outside_checkout_keeps_its_directory_importable(tmp_path):
+    """-I drops the script directory, and run_path does not put it back for a .py file."""
+    root = tmp_path / "source"
+    root.mkdir()
+    (root / "checkout_only.py").write_text("value = 'from checkout'\n")
+    app = tmp_path / "webui"
+    (app / "api").mkdir(parents=True)
+    (app / "api" / "__init__.py").write_text("")
+    (app / "api" / "marker.py").write_text("token = 'local-api'\n")
+    script = app / "server.py"
+    script.write_text(
+        "import api.marker, checkout_only, json, sys\n"
+        "print(json.dumps([api.marker.token, checkout_only.value, sys.argv[1:]]))\n"
+    )
+    argv = [str(script), "--host", "0.0.0.0"]
+    command = venv_sync.relaunch_command(
+        Path(sys.executable), root, argv, [sys.executable, *argv], None,
+    )
+    result = subprocess.run(command, cwd=tmp_path, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == ["local-api", "from checkout", ["--host", "0.0.0.0"]]
+
+
 def test_relaunch_runs_zip_launchers_and_preserves_interpreter_options(tmp_path):
     import zipfile
     launcher = tmp_path / "hermes.exe"
