@@ -43,6 +43,8 @@ register = _line.register
 check_requirements = _line.check_requirements
 validate_config = _line.validate_config
 _standalone_send = _line._standalone_send
+_first_sent_message_id = _line._first_sent_message_id
+_LineClient = _line._LineClient
 _env_enablement = _line._env_enablement
 
 
@@ -601,4 +603,109 @@ class TestLineGroupSessions:
         adapter._pending_buttons["Uchat"] = rid
         asyncio.run(adapter.send("Uchat", "<think>hidden</think>Visible answer"))
         assert adapter._cache.get(rid).payload == "Visible answer"
+
+
+# ---------------------------------------------------------------------------
+# 10. _first_sent_message_id on the hardened reply/push send paths (c3c3154)
+# ---------------------------------------------------------------------------
+
+
+class _FakeLineResp:
+    """Minimal aiohttp-style response returned at the HTTP network boundary."""
+
+    def __init__(self, payload=None, *, raise_json=False, status=200):
+        self.status = status
+        self._payload = payload
+        self._raise_json = raise_json
+
+    async def json(self, content_type=None):
+        if self._raise_json:
+            raise ValueError("unparseable body")
+        return self._payload
+
+    async def text(self):
+        return json.dumps(self._payload)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _FakeLineSession:
+    """Fake aiohttp session: an ``async with`` wrapper whose ``post`` yields a fake resp."""
+
+    def __init__(self, payload=None, *, raise_json=False):
+        self._resp = _FakeLineResp(payload, raise_json=raise_json)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def post(self, url, headers=None, json=None):
+        return self._resp
+
+
+def _mock_line_network(monkeypatch, payload=None, *, raise_json=False):
+    """Patch the LINE client's aiohttp session at the network boundary."""
+    monkeypatch.setattr(
+        _LineClient, "_session",
+        staticmethod(lambda _timeout: _FakeLineSession(payload, raise_json=raise_json)),
+    )
+
+
+class TestFirstSentMessageId:
+    """reply/push send paths return sentMessages[0].id on the wire (c3c3154)."""
+
+    @pytest.fixture
+    def adapter(self, monkeypatch):
+        monkeypatch.delenv("LINE_CHANNEL_ACCESS_TOKEN", raising=False)
+        monkeypatch.delenv("LINE_CHANNEL_SECRET", raising=False)
+        from gateway.config import PlatformConfig
+        cfg = PlatformConfig(enabled=True, extra={"channel_access_token": "tok", "channel_secret": "sec"})
+        ad = LineAdapter(cfg)
+        ad._client = _LineClient("tok")  # real client; only the HTTP boundary is mocked
+        return ad
+
+    def test_reply_returns_first_sent_id(self, adapter, monkeypatch):
+        import time
+        adapter._reply_tokens["Uchat"] = ("rtok", time.time() + 3600)
+        _mock_line_network(monkeypatch, {"sentMessages": [{"id": "123", "type": "text"}]})
+        result = asyncio.run(adapter.send("Uchat", "hello"))
+        assert result.success
+        assert result.message_id == "123"
+
+    def test_push_returns_first_sent_id(self, adapter, monkeypatch):
+        _mock_line_network(monkeypatch, {"sentMessages": [{"id": "123", "type": "text"}]})
+        result = asyncio.run(adapter.send("Uchat", "hello"))
+        assert result.success
+        assert result.message_id == "123"
+
+    def test_empty_response_returns_none_without_raising(self, adapter, monkeypatch):
+        _mock_line_network(monkeypatch, {})
+        result = asyncio.run(adapter.send("Uchat", "hello"))
+        assert result.success
+        assert result.message_id is None
+
+    def test_unparseable_response_returns_none_without_raising(self, adapter, monkeypatch):
+        _mock_line_network(monkeypatch, None, raise_json=True)
+        result = asyncio.run(adapter.send("Uchat", "hello"))
+        assert result.success
+        assert result.message_id is None
+
+    def test_first_sent_message_id_reads_first(self):
+        resp = _FakeLineResp({"sentMessages": [{"id": "123", "type": "text"}]})
+        assert asyncio.run(_first_sent_message_id(resp)) == "123"
+
+    def test_first_sent_message_id_missing_returns_none(self):
+        assert asyncio.run(_first_sent_message_id(_FakeLineResp({}))) is None
+        assert asyncio.run(_first_sent_message_id(_FakeLineResp({"sentMessages": []}))) is None
+        assert asyncio.run(_first_sent_message_id(_FakeLineResp({"sentMessages": [{"type": "text"}]}))) is None
+
+    def test_first_sent_message_id_unparseable_returns_none(self):
+        resp = _FakeLineResp(None, raise_json=True)
+        assert asyncio.run(_first_sent_message_id(resp)) is None
 

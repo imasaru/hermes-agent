@@ -238,18 +238,21 @@ class _LineClient:
         import aiohttp
         return aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout), trust_env=gateway_trust_env())
 
-    async def _post_messages(self, url: str, label: str, payload: dict[str, Any]) -> None:
+    async def _post_messages(self, url: str, label: str, payload: dict[str, Any]) -> Optional[str]:
+        """POST a message payload, returning the first ``sentMessages[].id`` when LINE sends one."""
         async with self._session(self._timeout) as session:
             async with session.post(url, headers=self._headers, json=payload) as resp:
                 if resp.status >= 400:
                     body = await resp.text()
                     raise RuntimeError(f"LINE {label} {resp.status}: {body[:200]}")
+                return await _first_sent_message_id(resp)
 
-    async def reply(self, reply_token: str, messages: list[dict[str, Any]]) -> None:
-        await self._post_messages(LINE_REPLY_URL, "reply", {"replyToken": reply_token, "messages": messages})
+    async def reply(self, reply_token: str, messages: list[dict[str, Any]]) -> Optional[str]:
+        return await self._post_messages(
+            LINE_REPLY_URL, "reply", {"replyToken": reply_token, "messages": messages})
 
-    async def push(self, chat_id: str, messages: list[dict[str, Any]]) -> None:
-        await self._post_messages(LINE_PUSH_URL, "push", {"to": chat_id, "messages": messages})
+    async def push(self, chat_id: str, messages: list[dict[str, Any]]) -> Optional[str]:
+        return await self._post_messages(LINE_PUSH_URL, "push", {"to": chat_id, "messages": messages})
 
     async def loading(self, chat_id: str, seconds: int = 60) -> None:
         """Loading indicator (DM only). LINE rejects this for groups/rooms."""
@@ -349,6 +352,19 @@ def _text_messages(content: str) -> list[dict[str, Any]]:
     """Think-strip, markdown-strip, chunk and cap ``content`` into ≤5 LINE text messages."""
     chunks = split_for_line(strip_markdown_preserving_urls(_strip_think_blocks(content)))
     return [_text_message(c) for c in chunks][:LINE_MAX_MESSAGES_PER_CALL]
+
+
+async def _first_sent_message_id(resp) -> Optional[str]:
+    """LINE reply/push bodies carry ``sentMessages[0].id`` when the call succeeds."""
+    try:
+        data = await resp.json(content_type=None)
+        sent = (data or {}).get("sentMessages") if isinstance(data, dict) else None
+        if not sent:
+            return None
+        message_id = sent[0].get("id")
+        return str(message_id) if message_id else None
+    except Exception:
+        return None
 
 
 def build_postback_button_message(text: str, button_label: str, request_id: str) -> dict[str, Any]:
